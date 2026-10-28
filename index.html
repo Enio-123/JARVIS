@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>JARVIS</title>
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: rgba(18, 21, 26, 0.88);
+    --line: rgba(255, 255, 255, 0.09);
+    --text: #e9edf2;
+    --muted: #8a93a1;
+    --accent: #5cc8ff;
+    --warn: #f2a541;
+    --danger: #ff6b5e;
+    --ok: #3fb68b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; color: var(--text); overflow: hidden;
+    background: radial-gradient(120% 90% at 50% 38%, #142030 0%, #0b1018 45%, #06080b 100%) fixed, var(--bg);
+    font: 14px/1.45 "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #scene, #hands { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  #hands { pointer-events: none; }
+  [hidden] { display: none !important; }
+
+  button, input, select { font: inherit; color: var(--text); }
+  button { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; height: 36px; padding: 0 14px;
+    cursor: pointer; }
+  button:hover { border-color: rgba(255, 255, 255, 0.22); }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #061018; font-weight: 600; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  .icon { width: 36px; padding: 0; display: grid; place-items: center; }
+  .icon svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .icon.off { color: var(--muted); }
+  .icon.off .on-only { display: none; }
+  .icon:not(.off) .off-only { display: none; }
+
+  .top { position: fixed; top: 16px; left: 16px; right: 16px; display: flex; justify-content: space-between;
+    align-items: flex-start; gap: 12px; pointer-events: none; }
+  .top > * { pointer-events: auto; }
+  .brand h1 { margin: 0 0 2px; font-size: 15px; font-weight: 600; letter-spacing: 3px; }
+  .status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.listen { background: var(--ok); }
+  .dot.busy { background: var(--warn); }
+  .dot.speak { background: var(--accent); }
+  .dot.err { background: var(--danger); }
+  .actions { display: flex; gap: 8px; }
+
+  .voice { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); width: min(640px, calc(100% - 32px));
+    display: flex; flex-direction: column; align-items: center; gap: 10px; pointer-events: none; }
+  .caption { text-align: center; min-height: 20px; }
+  .caption .you { color: var(--muted); font-size: 13px; margin-bottom: 4px; }
+  .caption .him { font-size: 17px; line-height: 1.5; text-wrap: balance; text-shadow: 0 1px 12px rgba(0, 0, 0, 0.8); }
+  .caption .note { color: var(--muted); font-size: 13px; }
+
+  .preview { position: fixed; left: 16px; bottom: 16px; width: 176px; border-radius: 10px; overflow: hidden;
+    border: 1px solid var(--line); background: #000; display: none; }
+  .preview.show { display: block; }
+  .preview video { display: block; width: 100%; transform: scaleX(-1); }
+  .tag { position: fixed; pointer-events: none; background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 3px 8px; font-size: 12px; transform: translate(14px, -50%); white-space: nowrap; }
+  .hint { position: fixed; right: 16px; bottom: 16px; color: var(--muted); font-size: 12px; text-align: right; line-height: 1.6; }
+  .hint b { color: var(--text); font-weight: 500; }
+
+  .modal { position: fixed; inset: 0; display: none; place-items: center; background: rgba(6, 7, 9, 0.6); z-index: 5; }
+  .modal.show { display: grid; }
+  .modal.start { background: none; place-items: end center; padding-bottom: 32px; }
+  .modal.start .card { background: rgba(20, 23, 28, 0.92); backdrop-filter: blur(10px); }
+  .modal.start .row { align-items: center; margin-top: 0; }
+  .card { width: min(460px, calc(100% - 32px)); max-height: calc(100% - 32px); overflow: auto; background: #14171c;
+    border: 1px solid var(--line); border-radius: 12px; padding: 22px; }
+  .card h2 { margin: 0 0 6px; font-size: 17px; font-weight: 600; }
+  .card p { margin: 0 0 16px; color: var(--muted); }
+  .card a { color: var(--accent); }
+  .field { margin-bottom: 16px; }
+  .field label { display: block; font-size: 13px; margin-bottom: 6px; }
+  .field small { display: block; color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .field input[type=password], .field input[type=text], .field select { width: 100%; height: 38px; padding: 0 12px;
+    background: #0e1014; border: 1px solid var(--line); border-radius: 8px; }
+  .inline { display: flex; gap: 8px; }
+  .inline > input, .inline > select { flex: 1; min-width: 0; }
+  .check { display: flex; gap: 10px; align-items: flex-start; font-size: 13px; cursor: pointer; }
+  .check input { margin-top: 2px; accent-color: var(--accent); }
+  .row { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; margin-top: 8px; }
+  .row .left { margin-right: auto; }
+  .sep { height: 1px; background: var(--line); margin: 18px 0; }
+  .result { font-size: 12px; margin-top: 6px; color: var(--muted); }
+  .result.ok { color: var(--ok); }
+  .result.err { color: var(--danger); }
+  .bar { height: 6px; background: rgba(255, 255, 255, 0.08); border-radius: 3px; overflow: hidden; margin-bottom: 16px; }
+  .bar div { height: 100%; width: 0; background: var(--accent); transition: width .1s linear; }
+  .text { min-height: 40px; }
+
+  @media (max-width: 700px) {
+    .hint { display: none; }
+    .preview { bottom: auto; top: 70px; width: 112px; }
+    .caption .him { font-size: 15px; }
+  }
+</style>
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.js" } }
+</script>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<canvas id="hands"></canvas>
+
+<div class="top">
+  <div class="brand">
+    <h1>JARVIS</h1>
+    <div class="status"><span class="dot" id="dot"></span><span id="status">Desligado</span></div>
+  </div>
+  <div class="actions">
+    <button class="icon" id="btnMic" title="Pausar o microfone" aria-label="Pausar o microfone">
+      <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/><path class="off-only" d="M4 4l16 16"/></svg>
+    </button>
+    <button class="icon off" id="btnCam" title="Ligar a câmera (mãos)" aria-label="Ligar a câmera">
+      <svg viewBox="0 0 24 24"><path d="M3 7h12v10H3zM15 10l6-3v10l-6-3"/><path class="off-only" d="M3 3l18 18"/></svg>
+    </button>
+    <button class="icon" id="btnSettings" title="Configurações" aria-label="Configurações">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+    </button>
+  </div>
+</div>
+
+<div class="voice">
+  <div class="caption" aria-live="polite">
+    <div class="you" id="capYou"></div>
+    <div class="him" id="capHim"></div>
+    <div class="note" id="capNote"></div>
+  </div>
+</div>
+
+<div class="preview" id="preview"><video id="video" playsinline muted></video></div>
+<div class="tag" id="tag" hidden></div>
+<div class="hint" id="hint" hidden>
+  <b>Pinça</b> pega o modelo<br>
+  <b>Pinça com o dedo médio</b> pega uma peça<br>
+  <b>Duas mãos</b> giram e mudam o tamanho
+</div>
+
+<!-- Início -->
+<div class="modal show start" id="start" role="dialog" aria-modal="true" aria-labelledby="startTitle">
+  <div class="card">
+    <h2 id="startTitle">Olá, eu sou o JARVIS</h2>
+    <p>Converse comigo por voz. Enquanto respondo, mostro modelos 3D do assunto, e você mexe neles com as mãos.</p>
+    <div class="field" id="startKeyField">
+      <label for="startKey">Chave da API da Groq</label>
+      <input type="password" id="startKey" autocomplete="off" spellcheck="false" placeholder="gsk_...">
+      <small>Crie em <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a>. Fica salva só neste navegador.</small>
+      <div class="result" id="startResult"></div>
+    </div>
+    <div class="row">
+      <label class="check left"><input type="checkbox" id="startCam" checked> Usar a câmera</label>
+      <button class="primary" id="btnStart">Iniciar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Configurações -->
+<div class="modal" id="settings" role="dialog" aria-modal="true" aria-labelledby="setTitle">
+  <div class="card">
+    <h2 id="setTitle">Configurações</h2>
+    <p>Tudo fica salvo só neste navegador.</p>
+
+    <div class="field">
+      <label for="setGroq">Chave da API da Groq</label>
+      <div class="inline">
+        <input type="password" id="setGroq" autocomplete="off" spellcheck="false" placeholder="gsk_...">
+        <button id="btnTestGroq">Testar</button>
+      </div>
+      <div class="result" id="groqResult"></div>
+    </div>
+
+    <div class="field">
+      <label for="setVoice">Voz</label>
+      <div class="inline">
+        <select id="setVoice"></select>
+        <button id="btnHear">Ouvir</button>
+      </div>
+      <small id="voiceInfo"></small>
+      <div class="result" id="voiceResult"></div>
+    </div>
+
+    <div id="elevenBox" hidden>
+      <div class="field">
+        <label for="setEleven">Chave da ElevenLabs</label>
+        <div class="inline">
+          <input type="password" id="setEleven" autocomplete="off" spellcheck="false" placeholder="sk_...">
+          <button id="btnLoadVoices">Carregar vozes</button>
+        </div>
+        <small>Crie em <a href="https://elevenlabs.io/app/settings/api-keys" target="_blank" rel="noopener">elevenlabs.io</a> (o plano grátis dá cerca de 10 mil caracteres por mês).</small>
+      </div>
+      <div class="field">
+        <label for="setElevenVoice">Voz da ElevenLabs</label>
+        <select id="setElevenVoice"></select>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="setName">Como o JARVIS te chama</label>
+      <input type="text" id="setName" maxlength="40" placeholder="senhor">
+    </div>
+
+    <label class="check field"><input type="checkbox" id="setWake"> Só responder quando eu disser "Jarvis" (bom para lugares com outras pessoas falando)</label>
+
+    <div class="sep"></div>
+    <div class="row">
+      <button class="left" id="btnCalib" disabled title="Ligue a câmera primeiro">Treinar mão</button>
+      <button id="btnWipe">Apagar dados</button>
+      <button class="primary" id="btnSaveSettings">Salvar</button>
+    </div>
+  </div>
+</div>
+
+<!-- Calibração da mão -->
+<div class="modal" id="calib" role="dialog" aria-modal="true" aria-labelledby="calibTitle">
+  <div class="card">
+    <h2 id="calibTitle">Treinar a sua mão</h2>
+    <p>São 2 passos de 2 segundos: mão aberta e depois a pinça.</p>
+    <div class="text" id="calibText">Mostre a mão para a câmera...</div>
+    <div class="bar"><div id="calibBar"></div></div>
+    <div class="row">
+      <button id="calibReset">Usar padrão</button>
+      <button id="calibCancel">Cancelar</button>
+      <button class="primary" id="calibDone" hidden>Concluir</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>
