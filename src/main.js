@@ -3,7 +3,8 @@ import { canvas, renderer, scene, camera, resize, updateCamera, raycast, pointAt
 import * as hands from './hands.js';
 import { GrabSystem } from './grab.js';
 import { Projector } from './projector.js';
-import { Brain, pickModels, transcribe, cleanSpeech, bracketNames, GroqError } from './brain.js';
+import { Brain, pickModels, transcribe, cleanSpeech, bracketNames, GroqError, sanitizeCommands } from './brain.js';
+import { buildPrefab } from './anatomy.js';
 import { Ear } from './ear.js';
 import { Voice, ENGINE_LABELS, PIPER_CACHE, elevenVoices, sentences } from './voice.js';
 import { Character } from './character.js';
@@ -44,6 +45,10 @@ const announcements = [];
 const FOLLOW_UP_MS = 12000; // depois de uma resposta, dá para continuar sem dizer "Jarvis"
 const FLING_PX = 1500; // velocidade da mão/mouse (pixels por segundo) que conta como "jogar fora"
 const WAKE = /\b(j[aáe]rv[iíe][sz]|jarvas|javis|jarbas|djarvis)\b/i;
+// Depois de "Jarvis", estas palavras só pedem para ele parar (não viram pergunta)
+const STOP = /^(para|pare|parar|pera|espera|chega|basta|sil[eê]ncio|cala|quiet[oa]|ok|okay|obrigad[oa]|valeu|beleza|tudo bem|j[aá] (deu|chega|entendi|sei)|pode parar|entendi|t[aá] bom)\b/i;
+// Sem o nome no prompt: o Whisper às vezes "repete" o prompt em ruído, o que daria falsos "Jarvis"
+const BARGE_PROMPT = 'Comando de voz em português.';
 
 const STATUS = {
   off: ['', 'Desligado'],
@@ -65,8 +70,14 @@ function setState(s) {
   $('dot').className = 'dot ' + cls;
   $('status').textContent = s === 'listening' && (music.playing || settings.wake) ? 'Diga “Jarvis”' : text;
   document.body.dataset.state = s;
-  ear?.setEnabled(s === 'listening' || s === 'hearing');
+  // enquanto ele pensa ou fala, o microfone continua ligado só para ouvir alguém chamando "Jarvis"
+  const jt = s === 'thinking' || s === 'speaking';
+  ear?.setEnabled(s === 'listening' || s === 'hearing' || (jt && !micPaused));
+  ear?.setBarge(jt);
+  if (!jt) unbarge();
 }
+
+const jarvisTurn = () => state === 'thinking' || state === 'speaking';
 
 function idle() {
   setState(micPaused ? 'paused' : 'listening');
@@ -141,11 +152,14 @@ function note(text, ms = 0, err = false) {
 }
 
 // ---------- Fala ----------
+let turnSpoken = []; // frases já faladas nesta resposta
 function beginSpeech(myTurn) {
+  turnSpoken = [];
   return voice.begin(settings, {
     onStart: (i, it) => {
       if (myTurn !== turn) return;
       setState('speaking');
+      turnSpoken.push(it.text);
       const raw = it.meta?.raw ?? it.text;
       showHim(raw);
       projector.setHighlight(bracketNames(raw));
@@ -195,6 +209,7 @@ function interrupt() {
     music.duck('user', false);
     projector.setHighlight([]);
     finishCaption();
+    lastReplyAt = performance.now(); // logo depois dá para pedir outra coisa sem repetir "Jarvis"
     idle();
   } else if (state === 'paused') {
     toggleMic();
@@ -202,29 +217,136 @@ function interrupt() {
 }
 
 // ---------- Ciclo: ouvir -> transcrever -> pensar e falar ao mesmo tempo ----------
+// As falas captadas entram numa fila curta (só a transcrição espera; a resposta corre em paralelo),
+// assim um "Jarvis" dito durante a resposta é ouvido na hora.
+let queue = Promise.resolve();
+function enqueue(fn) {
+  queue = queue.then(fn).catch((e) => console.warn(e));
+}
+
+function routeUtterance(wav) {
+  if (bargeWoke) { bargeWoke = false; return heardAfterWake(wav); }
+  if (jarvisTurn()) return bargeCheck(wav, false);
+  return onUtterance(wav);
+}
+
 async function onUtterance(wav) {
-  if (busy || !models) return;
+  if (!models) return;
   busy = true;
   const myTurn = turn;
   const needWake = wakeRequired();
   setState('thinking');
+  let text = '';
   try {
-    const text = await transcribe(settings.groqKey, models.stt, wav);
-    if (myTurn !== turn) return;
-    if (!text || (needWake && !WAKE.test(text))) {
-      music.duck('user', false);
-      idle();
-      return;
-    }
-    sfx?.ack();
-    music.duck('user', false);
-    await respond(text);
+    text = await transcribe(settings.groqKey, models.stt, wav);
   } catch (e) {
     music.duck('user', false);
-    if (e.name !== 'AbortError') await failSpeak(e);
+    if (e.name !== 'AbortError' && myTurn === turn) failSpeak(e);
+    else if (myTurn === turn) idle();
+    return;
   } finally {
     busy = false;
   }
+  if (myTurn !== turn) return;
+  music.duck('user', false);
+  if (!text || (needWake && !WAKE.test(text))) {
+    idle();
+    return;
+  }
+  sfx?.ack();
+  respond(text);
+}
+
+// ---------- Chamar "Jarvis" enquanto ele fala ----------
+// Quando alguém começa a falar por cima, a voz dele abaixa na hora. Se a fala tiver "Jarvis",
+// ele para de falar (a prévia do começo da fala já basta para isso); se não tiver, a voz volta.
+let bargeWoke = false; // o "Jarvis" já parou a fala; o resto do que a pessoa disser vira o pedido
+let bargeOpen = false;
+
+function unbarge() {
+  if (!bargeOpen) return;
+  bargeOpen = false;
+  voice?.duck(false);
+  music.duck('user', false);
+  document.body.classList.remove('barge');
+}
+
+// O que vem depois do nome ("Jarvis, me mostra um carro" -> "me mostra um carro")
+function afterWake(text) {
+  const m = text.match(WAKE);
+  if (!m) return text.trim();
+  return text.slice(m.index + m[0].length).replace(/^[\s,.!?:;…-]+/, '').trim();
+}
+
+// O trecho é só a voz do próprio JARVIS voltando pelo microfone?
+function isEcho(text) {
+  const said = new Set(normalizeWords(turnSpoken.join(' ')));
+  const words = normalizeWords(text).filter((w) => w.length > 2);
+  if (!words.length) return false;
+  return words.filter((w) => said.has(w)).length / words.length >= 0.6;
+}
+const normalizeWords = (t) => t.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(Boolean);
+
+async function bargeCheck(wav, early) {
+  if (!models) return;
+  const myTurn = turn;
+  let text = '';
+  try {
+    text = await transcribe(settings.groqKey, models.stt, wav, BARGE_PROMPT);
+  } catch {
+    if (!early) unbarge();
+    return;
+  }
+  if (myTurn !== turn || !jarvisTurn()) {
+    if (!early) unbarge();
+    return;
+  }
+  // ele mesmo disse o próprio nome nesta resposta: não conta
+  const selfNamed = turnSpoken.slice(-2).some((t) => WAKE.test(t));
+  if (!WAKE.test(text) || selfNamed) {
+    if (!early) {
+      unbarge();
+      // foi só eco ou conversa paralela: exige um pouco mais de volume da próxima vez
+      if (ear) ear.bargeBoost = Math.min(2.5, ear.bargeBoost + 0.25);
+    }
+    return;
+  }
+  // ouviu o nome: para de falar na hora
+  if (ear) ear.bargeBoost = 1;
+  interrupt();
+  sfx?.chirp();
+  if (early) {
+    // a pessoa ainda está falando: o pedido completo chega quando ela terminar
+    bargeWoke = true;
+    if (ear?.speaking && state === 'listening') {
+      setState('hearing');
+      if (music.playing) music.duck('user', true);
+    }
+    return;
+  }
+  const rest = afterWake(text);
+  if (!rest || STOP.test(rest) || isEcho(rest)) return;
+  showYou(rest);
+  respond(rest);
+}
+
+// Fala completa de quem interrompeu com "Jarvis" (a voz dele já parou)
+async function heardAfterWake(wav) {
+  if (!models) return;
+  const myTurn = turn;
+  setState('thinking');
+  let text = '';
+  try {
+    text = await transcribe(settings.groqKey, models.stt, wav, BARGE_PROMPT);
+  } catch {
+    if (myTurn === turn) idle();
+    return;
+  }
+  if (myTurn !== turn) return;
+  const rest = afterWake(text);
+  if (!rest || STOP.test(rest) || isEcho(rest)) { idle(); return; }
+  sfx?.ack();
+  respond(rest);
 }
 
 function context() {
@@ -289,17 +411,14 @@ async function failSpeak(e) {
 }
 
 // ---------- Comandos que vêm junto da resposta ----------
+let loadSeq = 0; // cada pedido novo de cena cancela um modelo que ainda estava carregando
+
 function applyCommands(c) {
   if (c.cena) {
-    const m = projector.apply(c.cena, c.modelo);
-    if (m) {
-      sfx?.materialize();
-      jarvis.present(m.position.clone());
-      showHint();
-    } else if (c.cena === 'limpar') {
-      sfx?.dismiss();
-    }
-    updateHint();
+    const my = ++loadSeq;
+    projector.hideLoader();
+    if (c.pronto) loadPrefab(c.pronto, c.cena, my);
+    else shown(projector.apply(c.cena, c.modelo), c.cena);
   }
   if (c.acao === 'explodir') projector.explode(true);
   else if (c.acao === 'montar') projector.explode(false);
@@ -319,6 +438,31 @@ function applyCommands(c) {
   }
   if (c.lembrar) memory.add(c.lembrar);
   if (c.esquecer) memory.forget(c.esquecer);
+}
+
+function shown(m, cena) {
+  if (m) {
+    sfx?.materialize();
+    jarvis.present(m.position.clone());
+    showHint();
+  } else if (cena === 'limpar') {
+    sfx?.dismiss();
+  }
+  updateHint();
+}
+
+// Modelos prontos de anatomia: montados aos poucos, com o holograma de "carregando" no lugar
+async function loadPrefab(name, cena, my) {
+  let modelo = null;
+  try {
+    modelo = await buildPrefab(name, (k, nome, fase) => { if (my === loadSeq) projector.showLoader(nome, `${fase} ${Math.round(k * 100)}%`); });
+  } catch (e) {
+    console.warn(e);
+  }
+  if (my !== loadSeq) return;
+  projector.hideLoader();
+  if (!modelo) { note('Não consegui montar esse modelo.', 6000, true); return; }
+  shown(projector.apply(cena, modelo), cena);
 }
 
 // ---------- Timers ----------
@@ -430,13 +574,26 @@ function unlockSpeech() {
 }
 
 function wireEar() {
-  ear.onUtterance = onUtterance;
+  ear.refLevel = () => (voice ? voice.outRms() : 0);
+  ear.onUtterance = (wav) => enqueue(() => routeUtterance(wav));
+  ear.onEarly = (wav) => {
+    if (jarvisTurn() && !bargeWoke) enqueue(() => (bargeWoke ? null : bargeCheck(wav, true)));
+  };
   ear.onSpeechStart = () => {
+    if (jarvisTurn()) {
+      // alguém falando por cima: abaixa a voz dele enquanto descobre se é com ele
+      bargeOpen = true;
+      voice?.duck(true);
+      music.duck('user', true);
+      document.body.classList.add('barge');
+      return;
+    }
     if (state !== 'listening') return;
     setState('hearing');
     if (music.playing) music.duck('user', true);
   };
   ear.onSpeechEnd = () => {
+    unbarge();
     music.duck('user', false);
     if (state === 'hearing') idle();
   };
@@ -770,6 +927,24 @@ function pinchEnd(g, kind, t = performance.now()) {
 
 hands.onPinch(pinchStart, pinchEnd);
 
+// O que cada mão está fazendo, para o desenho da mão na tela
+const handTmp = new THREE.Vector3();
+function handInfo(h) {
+  const m = grab.heldBy(h);
+  const part = heldParts.get(h)?.part;
+  const obj = m || part;
+  let target = null, pair = null;
+  if (obj) {
+    const s = toScreen(obj.getWorldPosition(handTmp));
+    if (!s.behind) target = s;
+  }
+  if (m && grab.pairs.has(m)) {
+    const other = hands.hands.find((o) => o !== h && o.present && grab.heldBy(o) === m);
+    if (other) pair = { x: other.x, y: other.y };
+  }
+  return { hold: m ? 'model' : part ? 'part' : null, target, hover: !!h.hover, pair };
+}
+
 // Mouse e toque: esquerdo/dedo = pinça (holograma), direito = dedo médio (peça), rodinha = tamanho.
 // Dois dedos no mesmo holograma giram e mudam o tamanho, como as duas mãos.
 const mouse = { kind: 'mouse', present: false, x: -1, y: -1, size: 0, roll: undefined, pinchKind: null };
@@ -841,11 +1016,12 @@ function updateHover() {
   const free = pointers().filter((g) => !g.pinchKind && g.kind !== 'touch');
   let pet = false;
   let shown = false;
+  for (const h of hands.hands) if (h.pinchKind || !h.present) h.hover = false;
   for (const g of free) {
     if (!pet && hitsRobot(g.x, g.y)) pet = true;
-    if (shown || !projector.models.length) continue;
-    const hit = raycast(g.x, g.y, projector.parts(), false);
-    if (!hit) continue;
+    const hit = projector.models.length ? raycast(g.x, g.y, projector.parts(), false) : null;
+    g.hover = !!hit; // a mira da mão "trava" em cima do holograma
+    if (shown || !hit) continue;
     shown = true;
     if (tag.textContent !== hit.object.name) tag.textContent = hit.object.name;
     tag.style.left = g.x + 'px';
@@ -909,10 +1085,31 @@ function updateHud() {
     const underCard = card && y < card.bottom && x > card.left - 80 && x < card.right + 80;
     el.style.visibility = s.behind || u.held || underCard ? 'hidden' : '';
     const n = u.partNames.length;
-    setText(el.lastChild, u.build < 1 ? 'Montando holograma' : u.exploded ? `Vista explodida · ${n} peças` : `${n} ${n === 1 ? 'peça' : 'peças'}`);
+    const info = u.build < 1 ? 'Montando holograma' : u.exploded ? `Vista explodida · ${n} peças` : `${n} ${n === 1 ? 'peça' : 'peças'}`;
+    setText(el.lastChild, u.fonte && u.build >= 1 ? `${info} · ${u.fonte}` : info);
+  }
+  // holograma de "carregando": nome do modelo e progresso
+  const ld = projector.loader;
+  if (ld) {
+    let el = modelLabels.get(ld);
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'mlabel';
+      el.innerHTML = '<b></b><span></span>';
+      labelLayer.append(el);
+      modelLabels.set(ld, el);
+      requestAnimationFrame(() => el.classList.add('show'));
+    }
+    setText(el.firstChild, ld.userData.nome || '');
+    setText(el.lastChild, ld.userData.text || '');
+    wp.copy(ld.position);
+    wp.y += 1.35 * ld.scale.x;
+    const s = toScreen(wp);
+    el.style.transform = `translate(${Math.min(innerWidth - 90, Math.max(90, s.x)).toFixed(1)}px, ${Math.max(narrow.matches ? 150 : 120, s.y).toFixed(1)}px) translate(-50%, -100%)`;
+    el.style.opacity = ld.userData.on ? '' : '0';
   }
   for (const [m, el] of modelLabels) {
-    if (!projector.models.includes(m)) { el.remove(); modelLabels.delete(m); }
+    if (!projector.models.includes(m) && m !== ld) { el.remove(); modelLabels.delete(m); }
   }
 
   // peças que o JARVIS está citando: etiqueta com linhas até as peças
@@ -1182,7 +1379,8 @@ new MutationObserver(markCard).observe($('timers'), { childList: true });
 addEventListener('resize', markCard);
 
 function placeCast(dt, t) {
-  const has = projector.models.length > 0;
+  const loading = !!projector.loader?.userData.on;
+  const has = projector.models.length > 0 || loading;
   const off = state === 'off';
   const musicOn = !music.el.hidden;
   if (cardDirty) {
@@ -1210,7 +1408,7 @@ function placeCast(dt, t) {
   platTarget.set(projector.centerX, 0.01, 0);
   platform.position.lerp(platTarget, 1 - Math.exp(-dt * 3));
   platform.visible = has;
-  const building = projector.models.some((m) => m.userData.build < 1);
+  const building = loading || projector.models.some((m) => m.userData.build < 1);
   platform.rotation.y += dt * (building ? 0.9 : 0.06);
   const u = platform.userData;
   u.ringMat.opacity += ((building ? 1 : 0.6 + 0.08 * Math.sin(t * 1.5)) - u.ringMat.opacity) * Math.min(1, dt * 5);
@@ -1265,7 +1463,7 @@ function frame() {
   partGrab.update(dt);
   projector.update(dt);
   updateCamera(dt);
-  hands.drawHands();
+  hands.drawHands(handInfo);
   if (frameNo % 3 === 0) updateHover();
   const level = state === 'speaking' ? voice?.level() || 0 : ear?.level || 0;
   placeCast(dt, t);
@@ -1291,8 +1489,12 @@ if (debug) {
     getState: () => state,
     respond: (t) => respond(t),
     onUtterance: (w) => onUtterance(w),
+    routeUtterance: (w) => routeUtterance(w),
+    bargeCheck: (w, early) => bargeCheck(w, early),
+    get bargeWoke() { return bargeWoke; },
     say: (t) => say(t),
     applyCommands: (c) => applyCommands(c),
+    command: (raw) => applyCommands(sanitizeCommands(raw)),
     interrupt: () => interrupt(),
   };
 }

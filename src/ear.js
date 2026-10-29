@@ -16,11 +16,16 @@ const PREROLL_MS = 400;
 const END_SILENCE_MS = 850;
 const MIN_SPEECH_MS = 300;
 const MAX_UTTERANCE_MS = 25000;
+// Falando por cima do JARVIS: corta mais cedo e manda uma prévia logo no começo,
+// para o "Jarvis" ser reconhecido enquanto a pessoa ainda fala
+const BARGE_SILENCE_MS = 550;
+const BARGE_MAX_MS = 7000;
+const EARLY_MS = 700;
 
 export class Ear {
   constructor(ctx) {
     this.ctx = ctx;
-    this.enabled = false; // só escuta quando o JARVIS não está falando nem pensando
+    this.enabled = false;
     this.onUtterance = () => {};
     this.onLevel = () => {};
     this.onSpeechStart = () => {};
@@ -29,6 +34,14 @@ export class Ear {
     this.maxMs = MAX_UTTERANCE_MS;
     this.floor = 0.004;
     this.level = 0;
+    // Modo "por cima": o JARVIS está falando e o microfone só procura alguém chamando por ele
+    this.barge = false;
+    this.bargeBoost = 1; // sobe quando o eco engana o detector, para errar menos
+    this.refLevel = null; // () => volume que está saindo nos alto-falantes (-1 se desconhecido)
+    this.echo = 0.25; // quanto do som de saída volta pelo microfone (aprendido)
+    this.refHist = new Float32Array(10);
+    this.refIdx = 0;
+    this.onEarly = null;
     this._reset();
   }
 
@@ -39,6 +52,7 @@ export class Ear {
     this.silentMs = 0;
     this.totalMs = 0;
     this.onRun = 0;
+    this.earlySent = false;
   }
 
   async start() {
@@ -75,6 +89,13 @@ export class Ear {
     this._reset();
   }
 
+  // Ao sair do modo "por cima" no meio de uma fala, a fala continua sendo gravada
+  setBarge(on) {
+    if (on === this.barge) return;
+    this.barge = on;
+    if (on && !this.speaking) this._reset();
+  }
+
   _push(chunk) {
     const buf = new Float32Array(this.pending.length + chunk.length);
     buf.set(this.pending);
@@ -91,13 +112,35 @@ export class Ear {
     this.level += (rms - this.level) * 0.3;
     this.onLevel(this.level);
 
-    // Piso de ruído: desce rápido e sobe devagar (só quando não há fala)
-    if (!this.speaking) this.floor = rms < this.floor ? this.floor * 0.9 + rms * 0.1 : this.floor * 0.998 + rms * 0.002;
-    this.floor = Math.max(this.floor, 0.0015);
+    // Enquanto o JARVIS fala, o microfone também capta a voz dele (o eco que o cancelamento não tirou).
+    // Guarda o pico do que saiu nos últimos 200 ms e aprende quanto disso volta pelo microfone.
+    let refPeak = 0;
+    let refKnown = true;
+    if (this.barge) {
+      const r = this.refLevel ? this.refLevel() : -1;
+      refKnown = r >= 0;
+      this.refHist[this.refIdx++ % this.refHist.length] = Math.max(0, r);
+      for (const v of this.refHist) if (v > refPeak) refPeak = v;
+      if (refKnown && !this.speaking && this.onRun === 0 && refPeak > 0.003) {
+        const ratio = Math.min(2, rms / refPeak);
+        this.echo += (ratio - this.echo) * (ratio > this.echo ? 0.05 : 0.03);
+      }
+    } else {
+      this.refHist.fill(0);
+      // Piso de ruído: desce rápido e sobe devagar (só quando não há fala)
+      if (!this.speaking) this.floor = rms < this.floor ? this.floor * 0.9 + rms * 0.1 : this.floor * 0.998 + rms * 0.002;
+      this.floor = Math.max(this.floor, 0.0015);
+    }
     if (!this.enabled) return;
 
-    const startT = Math.max(this.floor * 3.2, 0.012) * this.sensitivity;
-    const keepT = Math.max(this.floor * 2, 0.008);
+    let startT = Math.max(this.floor * 3.2, 0.012) * this.sensitivity;
+    let keepT = Math.max(this.floor * 2, 0.008);
+    if (this.barge) {
+      // para chamar o JARVIS enquanto ele fala, a voz precisa se destacar do eco dele
+      const echoT = refPeak * this.echo * 2.4;
+      startT = Math.max(startT * (refKnown ? 1.3 : 2.4), echoT) * this.bargeBoost;
+      keepT = Math.max(keepT, echoT * 0.6);
+    }
 
     this.frames.push(f);
     if (!this.speaking) {
@@ -105,7 +148,7 @@ export class Ear {
       const max = Math.ceil(PREROLL_MS / FRAME_MS);
       if (this.frames.length > max) this.frames.shift();
       this.onRun = rms > startT ? this.onRun + 1 : 0;
-      if (this.onRun >= 3) {
+      if (this.onRun >= (this.barge ? 6 : 3)) {
         this.speaking = true;
         this.voicedMs = this.onRun * FRAME_MS;
         this.silentMs = 0;
@@ -121,7 +164,13 @@ export class Ear {
     } else {
       this.silentMs += FRAME_MS;
     }
-    if (this.silentMs >= END_SILENCE_MS || this.totalMs >= this.maxMs) {
+    if (this.barge && !this.earlySent && this.voicedMs >= EARLY_MS) {
+      this.earlySent = true;
+      this.onEarly?.(toWav(this.frames, this.ctx.sampleRate));
+    }
+    const endSilence = this.barge ? BARGE_SILENCE_MS : END_SILENCE_MS;
+    const maxMs = this.barge ? Math.min(this.maxMs, BARGE_MAX_MS) : this.maxMs;
+    if (this.silentMs >= endSilence || this.totalMs >= maxMs) {
       const frames = this.frames;
       const voiced = this.voicedMs;
       this._reset();

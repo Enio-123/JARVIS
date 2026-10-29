@@ -143,10 +143,14 @@ const BUFFER_ENGINES = new Set(['piper', 'eleven']);
 export class Voice {
   constructor(ctx) {
     this.ctx = ctx;
+    // fonte -> volume (abaixa quando alguém fala por cima) -> analisador -> alto-falantes
+    this.out = ctx.createGain();
     this.analyser = ctx.createAnalyser();
     this.analyser.fftSize = 512;
+    this.out.connect(this.analyser);
     this.analyser.connect(ctx.destination);
     this.wave = new Float32Array(this.analyser.fftSize);
+    this.ducked = false;
     this.piper = new PiperClient();
     this.voices = [];
     this.speakingNow = false;
@@ -195,10 +199,26 @@ export class Voice {
       this.fake += 0.25;
       return 0.25 + 0.2 * Math.abs(Math.sin(this.fake) * Math.sin(this.fake * 0.37));
     }
+    return Math.min(1, this.outRms() * 4);
+  }
+
+  // Volume real do que está saindo agora (RMS). -1 quando não dá para medir (voz do sistema).
+  outRms() {
+    if (!this.speakingNow) return 0;
+    if (this.mode === 'speech') return -1;
     this.analyser.getFloatTimeDomainData(this.wave);
     let s = 0;
     for (const v of this.wave) s += v * v;
-    return Math.min(1, Math.sqrt(s / this.wave.length) * 4);
+    return Math.sqrt(s / this.wave.length);
+  }
+
+  // Abaixa a voz na hora em que alguém começa a falar por cima (só nos motores com áudio próprio)
+  duck(on) {
+    if (on === this.ducked) return;
+    this.ducked = on;
+    const g = this.out.gain;
+    g.cancelScheduledValues(this.ctx.currentTime);
+    g.setTargetAtTime(on ? 0.22 : 1, this.ctx.currentTime, on ? 0.025 : 0.12);
   }
 
   // Quanto da frase atual já foi falado (0 a 1), para a legenda acompanhar a voz
@@ -218,6 +238,8 @@ export class Voice {
     this.speakingNow = false;
     this.now = null;
     this.wakeQueue?.();
+    this.ducked = true;
+    this.duck(false);
   }
 
   preparePiper() {
@@ -315,7 +337,7 @@ export class Voice {
       if (token !== this.token) return resolve();
       const src = this.ctx.createBufferSource();
       src.buffer = buf;
-      src.connect(this.analyser);
+      src.connect(this.out);
       src.onended = resolve;
       this.source = src;
       this.speakingNow = true;

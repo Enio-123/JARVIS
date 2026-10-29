@@ -77,6 +77,8 @@
   .dot.busy { background: var(--warn); box-shadow: 0 0 10px rgba(242, 165, 65, 0.7); animation: blink 1s ease-in-out infinite; }
   .dot.speak { background: var(--accent); box-shadow: 0 0 10px rgba(92, 208, 255, 0.8); }
   .dot.err { background: var(--danger); box-shadow: 0 0 10px rgba(255, 90, 79, 0.7); }
+  /* alguém falando por cima do JARVIS: ele abaixa a voz e presta atenção */
+  body.barge .dot { background: var(--ok); box-shadow: 0 0 12px rgba(63, 210, 155, 0.85); animation: none; }
   @keyframes blink { 50% { opacity: 0.35; } }
   .meter { display: inline-flex; gap: 2px; height: 12px; align-items: center; }
   .meter i { width: 2px; height: 12px; border-radius: 1px; background: var(--accent); opacity: 0.85; transform: scaleY(0.12); transform-origin: center; }

@@ -1,0 +1,12 @@
+{
+  "name": "jarvis-tools",
+  "private": true,
+  "type": "module",
+  "description": "Ferramentas para gerar os pacotes de anatomia (não fazem parte do site)",
+  "scripts": {
+    "anatomia": "node anatomia.mjs"
+  },
+  "dependencies": {
+    "meshoptimizer": "0.22.0"
+  }
+}

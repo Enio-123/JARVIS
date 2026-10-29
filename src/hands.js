@@ -56,6 +56,7 @@ function newHand(id) {
     kind: 'hand', id, present: false, lastSeen: 0,
     x: 0, y: 0, tipX: 0, tipY: 0, size: 0, roll: 0,
     ri: 1, rm: 1, pinchKind: null, offCount: 0, pts: null,
+    vis: { appearAt: 0, snapAt: -9, releaseAt: -9, hoverAt: -9, hover: false, ghost: null, lostAt: 0, trail: [] },
     fx: Array.from({ length: 21 }, () => new OneEuro()),
     fy: Array.from({ length: 21 }, () => new OneEuro()),
   };
@@ -110,6 +111,8 @@ function updatePinch(h) {
       h.pinchKind = h.ri <= h.rm * 1.15 ? 'index' : 'middle';
       h.offCount = 0;
       setPoint(h);
+      h.vis.snapAt = performance.now() / 1000;
+      h.vis.trail.length = 0;
       handlers.start(h, h.pinchKind);
     }
     return;
@@ -120,6 +123,8 @@ function updatePinch(h) {
     if (++h.offCount >= 2) {
       const k = h.pinchKind;
       h.pinchKind = null;
+      h.vis.releaseAt = performance.now() / 1000;
+      h.vis.releaseKind = k;
       handlers.end(h, k);
     }
   } else {
@@ -132,6 +137,11 @@ function lose(h) {
     const k = h.pinchKind;
     h.pinchKind = null;
     handlers.end(h, k);
+  }
+  // a mão some aos poucos em vez de desaparecer de uma vez
+  if (h.pts) {
+    h.vis.ghost = { pts: h.pts, size: h.size, x: h.x, y: h.y };
+    h.vis.lostAt = performance.now() / 1000;
   }
   h.present = false;
   h.pts = null;
@@ -156,6 +166,9 @@ function assign(dets, t) {
       h.fx.forEach((f) => f.reset());
       h.fy.forEach((f) => f.reset());
       h.size = d.size;
+      // mão nova na câmera: animação de "mão detectada"
+      if (t - h.vis.lostAt > 0.6) h.vis.appearAt = t;
+      h.vis.ghost = null;
     }
     h.present = true;
     h.lastSeen = t;
@@ -275,7 +288,15 @@ export async function calibrate(onStep, signal) {
 }
 
 // ---------- Desenho das mãos sobre a cena ----------
-const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+// Holograma da mão no estilo do HUD: palma translúcida com o "repulsor" no centro, dedos com brilho,
+// juntas e pontas marcadas, a pinça "carregando" conforme o polegar se aproxima, um estalo quando ela
+// fecha, a mira que trava em cima do holograma e uma linha até o que a mão está segurando.
+const FINGERS = [[0, 1, 2, 3, 4], [0, 5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], [0, 17, 18, 19, 20]];
+const PALM = [0, 1, 5, 9, 13, 17];
+const TIPS = [4, 8, 12, 16, 20];
+const CYAN = '92,208,255';
+const AMBER = '242,165,65';
+const CORE = '214,244,255';
 
 export function resizeOverlay() {
   const dpr = Math.min(devicePixelRatio, 2);
@@ -283,54 +304,323 @@ export function resizeOverlay() {
   overlay.height = innerHeight * dpr;
 }
 
-export function drawHands() {
+const clamp01 = (v) => Math.max(0, Math.min(1, v));
+const ease = (v) => 1 - Math.pow(1 - clamp01(v), 3);
+
+// Contorno de cada dedo (da base até a ponta) e largura em relação ao comprimento da palma
+const FINGER_SHAPES = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], [17, 18, 19, 20]];
+const FINGER_W = [0.26, 0.21, 0.22, 0.21, 0.18];
+const TAPER = [1, 0.9, 0.82, 0.74];
+
+// Dedo como um tubo achatado que afina até a ponta arredondada (entra no mesmo caminho da palma)
+function fingerShape(ctx, chain, width) {
+  const left = [], right = [];
+  let dx = 0, dy = 0;
+  chain.forEach((p, j) => {
+    const prev = chain[Math.max(0, j - 1)], next = chain[Math.min(chain.length - 1, j + 1)];
+    dx = next.x - prev.x;
+    dy = next.y - prev.y;
+    const l = Math.hypot(dx, dy) || 1;
+    dx /= l;
+    dy /= l;
+    const w = (width * TAPER[j]) / 2;
+    left.push({ x: p.x - dy * w, y: p.y + dx * w });
+    right.push({ x: p.x + dy * w, y: p.y - dx * w });
+  });
+  const tip = chain[chain.length - 1];
+  const a = Math.atan2(dy, dx);
+  ctx.moveTo(left[0].x, left[0].y);
+  for (let j = 1; j < left.length; j++) ctx.lineTo(left[j].x, left[j].y);
+  ctx.arc(tip.x, tip.y, (width * TAPER[chain.length - 1]) / 2, a + Math.PI / 2, a - Math.PI / 2, true);
+  for (let j = right.length - 2; j >= 0; j--) ctx.lineTo(right[j].x, right[j].y);
+  ctx.closePath();
+}
+
+// Liga os pontos com curvas suaves (a palma fica arredondada)
+function smoothPath(ctx, pts, closed, begin = true) {
+  const n = pts.length;
+  const at = (i) => pts[(i + n) % n];
+  if (begin) ctx.beginPath();
+  const m0 = closed ? { x: (at(-1).x + at(0).x) / 2, y: (at(-1).y + at(0).y) / 2 } : at(0);
+  ctx.moveTo(m0.x, m0.y);
+  for (let i = 0; i < (closed ? n : n - 1); i++) {
+    const p = at(i), q = at(i + 1);
+    ctx.quadraticCurveTo(p.x, p.y, (p.x + q.x) / 2, (p.y + q.y) / 2);
+  }
+  if (closed) ctx.closePath();
+}
+
+// Quanto a pinça está perto de fechar (0 = aberta, 1 = fechada)
+function closeness(r) {
+  const open = calib.off * 1.35;
+  return clamp01((open - r) / (open - calib.on));
+}
+
+// info(h) → { hold: 'model' | 'part' | null, target: { x, y } | null, hover: bool, pair: { x, y } | null }
+export function drawHands(info = () => ({})) {
   const dpr = Math.min(devicePixelRatio, 2);
   octx.setTransform(dpr, 0, 0, dpr, 0, 0);
   octx.clearRect(0, 0, innerWidth, innerHeight);
   const t = performance.now() / 1000;
+  octx.lineCap = 'round';
+  octx.lineJoin = 'round';
   for (const h of hands) {
-    if (!h.present || !h.pts) continue;
-    // esqueleto da mão em azul, discreto, no estilo do HUD
-    octx.lineCap = 'round';
-    octx.strokeStyle = 'rgba(92,208,255,0.35)';
-    octx.lineWidth = 1.5;
-    octx.beginPath();
-    for (const [a, b] of BONES) {
-      octx.moveTo(h.pts[a].x, h.pts[a].y);
-      octx.lineTo(h.pts[b].x, h.pts[b].y);
+    if (h.present && h.pts) {
+      drawHand(h, h.pts, h.size, ease((t - h.vis.appearAt) / 0.45), t, info(h) || {});
+    } else if (h.vis.ghost) {
+      const k = 1 - (t - h.vis.lostAt) / 0.35;
+      if (k <= 0) h.vis.ghost = null;
+      else drawHand(h, h.vis.ghost.pts, h.vis.ghost.size, k, t, {}, true);
     }
-    octx.stroke();
-    octx.fillStyle = 'rgba(190,236,255,0.8)';
-    h.pts.forEach((p, i) => {
-      octx.beginPath();
-      octx.arc(p.x, p.y, i % 4 === 0 && i ? 3.2 : 2, 0, Math.PI * 2);
-      octx.fill();
-    });
-    // mira da pinça: azul = indicador (modelo), âmbar = dedo médio (peça)
-    const rgb = h.pinchKind === 'middle' ? '242,165,65' : '92,208,255';
-    octx.strokeStyle = `rgba(${rgb},0.95)`;
-    octx.lineWidth = 2;
-    if (h.pinchKind) {
-      octx.fillStyle = `rgba(${rgb},0.3)`;
-      octx.beginPath();
-      octx.arc(h.x, h.y, 9, 0, Math.PI * 2);
-      octx.fill();
-      octx.stroke();
-      octx.lineWidth = 1;
-      octx.beginPath();
-      octx.arc(h.x, h.y, 16, 0, Math.PI * 2);
-      octx.stroke();
-    } else {
-      for (let k = 0; k < 3; k++) {
-        const a = t * 1.6 + (k * Math.PI * 2) / 3;
-        octx.beginPath();
-        octx.arc(h.x, h.y, 15, a, a + 1.25);
-        octx.stroke();
+  }
+}
+
+function drawHand(h, pts, size, a, t, info, ghost = false) {
+  const ctx = octx;
+  const k = Math.max(0.65, Math.min(1.6, size / 0.2)); // mão perto da câmera = traços maiores
+  const kind = h.pinchKind || (t - h.vis.releaseAt < 0.3 ? h.vis.releaseKind : null);
+  const rgb = kind === 'middle' ? AMBER : CYAN;
+  const born = t - h.vis.appearAt;
+  const scanning = !ghost && born < 0.7;
+
+  // volume da mão: palma e dedos preenchidos de leve (parece uma luva holográfica), com contorno
+  const palm = PALM.map((i) => pts[i]);
+  const pc = { x: (pts[0].x + pts[5].x + pts[9].x + pts[13].x + pts[17].x) / 5, y: (pts[0].y + pts[5].y + pts[9].y + pts[13].y + pts[17].y) / 5 };
+  const L = Math.hypot(pts[0].x - pts[9].x, pts[0].y - pts[9].y) + 1;
+  const grad = ctx.createRadialGradient(pc.x, pc.y, 0, pc.x, pc.y, L * 1.6);
+  grad.addColorStop(0, `rgba(${CYAN},${0.2 * a})`);
+  grad.addColorStop(1, `rgba(${CYAN},${0.05 * a})`);
+  ctx.beginPath();
+  smoothPath(ctx, palm, true, false);
+  FINGER_SHAPES.forEach((chain, i) => fingerShape(ctx, chain.map((j) => pts[j]), L * FINGER_W[i]));
+  ctx.fillStyle = grad;
+  ctx.fill('nonzero');
+  ctx.strokeStyle = `rgba(${CYAN},${0.42 * a})`;
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // ossos dos dedos: núcleo claro com um brilho suave em volta
+  for (const pass of [0, 1]) {
+    for (const f of FINGERS) {
+      for (let j = 0; j < f.length - 1; j++) {
+        const p = pts[f[j]], q = pts[f[j + 1]];
+        const taper = 1 - (j / (f.length - 1)) * 0.45;
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(q.x, q.y);
+        if (pass === 0) {
+          ctx.strokeStyle = `rgba(${CYAN},${0.12 * a})`;
+          ctx.lineWidth = 6 * k * taper;
+        } else {
+          ctx.strokeStyle = `rgba(${CORE},${0.8 * a})`;
+          ctx.lineWidth = 1.6 * k * taper;
+        }
+        ctx.stroke();
       }
-      octx.beginPath();
-      octx.arc(h.x, h.y, 2.2, 0, Math.PI * 2);
-      octx.fillStyle = `rgba(${rgb},0.95)`;
-      octx.fill();
+    }
+  }
+
+  // juntas e pontas dos dedos
+  for (let i = 1; i < 21; i++) {
+    const p = pts[i];
+    const tip = TIPS.includes(i);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, (tip ? 2.8 : i % 4 === 1 ? 2.6 : 1.9) * k, 0, Math.PI * 2);
+    ctx.fillStyle = tip ? `rgba(255,255,255,${0.95 * a})` : `rgba(${CYAN},${0.9 * a})`;
+    ctx.fill();
+    if (tip) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 5.5 * k, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(${CYAN},${0.4 * a})`;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+  }
+
+  // repulsor na palma: acende mais forte quando a mão está segurando algo
+  const live = h.pinchKind ? 1 : 0.45;
+  ctx.beginPath();
+  ctx.arc(pc.x, pc.y, 4.2 * k, 0, Math.PI * 2);
+  ctx.fillStyle = `rgba(${CORE},${0.75 * live * a})`;
+  ctx.fill();
+  ctx.lineWidth = 1.4;
+  ctx.strokeStyle = `rgba(${rgb},${0.8 * live * a})`;
+  for (let s = 0; s < 4; s++) {
+    const ang = t * (h.pinchKind ? 3 : 1.2) + (s * Math.PI) / 2;
+    ctx.beginPath();
+    ctx.arc(pc.x, pc.y, 9 * k, ang, ang + 0.9);
+    ctx.stroke();
+  }
+
+  // linha de varredura quando a mão acaba de aparecer
+  if (scanning) {
+    let y0 = Infinity, y1 = -Infinity, x0 = Infinity, x1 = -Infinity;
+    for (const p of pts) { y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y); x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x); }
+    const sy = y1 - (y1 - y0 + 30) * ease(born / 0.7) + 15;
+    const g2 = ctx.createLinearGradient(x0 - 20, 0, x1 + 20, 0);
+    g2.addColorStop(0, `rgba(${CYAN},0)`);
+    g2.addColorStop(0.5, `rgba(${CYAN},${0.9 * (1 - born / 0.7)})`);
+    g2.addColorStop(1, `rgba(${CYAN},0)`);
+    ctx.fillStyle = g2;
+    ctx.fillRect(x0 - 20, sy - 1, x1 - x0 + 40, 2);
+  }
+  if (ghost) return;
+
+  // pinça "carregando": linha entre o polegar e o dedo que vai fechar, com o arco enchendo
+  const useMiddle = h.pinchKind ? h.pinchKind === 'middle' : h.rm < h.ri * 0.87;
+  const other = pts[useMiddle ? 12 : 8];
+  const c = h.pinchKind ? 1 : closeness(useMiddle ? h.rm : h.ri);
+  const prgb = useMiddle ? AMBER : CYAN;
+  if (!h.pinchKind && c > 0.05) {
+    ctx.beginPath();
+    ctx.moveTo(pts[4].x, pts[4].y);
+    ctx.lineTo(other.x, other.y);
+    ctx.strokeStyle = `rgba(${prgb},${0.25 + 0.6 * c})`;
+    ctx.lineWidth = 1 + 1.5 * c;
+    ctx.setLineDash([3, 4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // mira no ponto da pinça
+  const x = h.x, y = h.y;
+  const R = 15 * Math.max(0.85, Math.min(1.3, k));
+  if (h.pinchKind) {
+    ctx.beginPath();
+    ctx.arc(x, y, 8, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${rgb},0.35)`;
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = `rgba(${rgb},0.95)`;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(x, y, R + 2, 0, Math.PI * 2);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = `rgba(${rgb},0.55)`;
+    ctx.stroke();
+  } else {
+    ctx.lineWidth = 1.6;
+    ctx.strokeStyle = `rgba(${prgb},0.9)`;
+    for (let s = 0; s < 3; s++) {
+      const ang = t * 1.6 + (s * Math.PI * 2) / 3;
+      ctx.beginPath();
+      ctx.arc(x, y, R, ang, ang + 1.25);
+      ctx.stroke();
+    }
+    // arco que enche conforme a pinça fecha
+    if (c > 0.05) {
+      ctx.beginPath();
+      ctx.arc(x, y, R + 5, -Math.PI / 2, -Math.PI / 2 + c * Math.PI * 2);
+      ctx.lineWidth = 2.2;
+      ctx.strokeStyle = `rgba(${prgb},${0.35 + 0.6 * c})`;
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.arc(x, y, 2.2, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${prgb},0.95)`;
+    ctx.fill();
+  }
+
+  // trava na mira quando a mão está em cima do holograma
+  if (info.hover && !h.pinchKind) {
+    if (!h.vis.hover) h.vis.hoverAt = t;
+    const e = ease((t - h.vis.hoverAt) / 0.18);
+    const r2 = R + 9 + (1 - e) * 14;
+    ctx.strokeStyle = `rgba(${CYAN},${0.9 * e})`;
+    ctx.lineWidth = 2;
+    for (let s = 0; s < 4; s++) {
+      const ang = Math.PI / 4 + (s * Math.PI) / 2;
+      const cx = x + Math.cos(ang) * r2, cy = y + Math.sin(ang) * r2;
+      const dx = -Math.sign(Math.cos(ang)) * 7, dy = -Math.sign(Math.sin(ang)) * 7;
+      ctx.beginPath();
+      ctx.moveTo(cx + dx, cy);
+      ctx.lineTo(cx, cy);
+      ctx.lineTo(cx, cy + dy);
+      ctx.stroke();
+    }
+  }
+  h.vis.hover = !!info.hover && !h.pinchKind;
+
+  // estalo quando a pinça fecha e quando solta
+  const snap = t - h.vis.snapAt;
+  if (snap < 0.4) {
+    ctx.beginPath();
+    ctx.arc(x, y, 10 + ease(snap / 0.4) * 26, 0, Math.PI * 2);
+    ctx.lineWidth = 2.5 * (1 - snap / 0.4);
+    ctx.strokeStyle = `rgba(${rgb},${0.9 * (1 - snap / 0.4)})`;
+    ctx.stroke();
+  }
+  const rel = t - h.vis.releaseAt;
+  if (rel < 0.3) {
+    ctx.beginPath();
+    ctx.arc(x, y, 30 - ease(rel / 0.3) * 18, 0, Math.PI * 2);
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = `rgba(${rgb},${0.7 * (1 - rel / 0.3)})`;
+    ctx.stroke();
+  }
+
+  // segurando: rastro do movimento e linha até o que está na mão
+  const tr = h.vis.trail;
+  if (h.pinchKind && info.hold) {
+    tr.push({ x, y, t });
+    while (tr.length && t - tr[0].t > 0.22) tr.shift();
+    for (let i = 1; i < tr.length; i++) {
+      const f = 1 - (t - tr[i].t) / 0.22;
+      ctx.beginPath();
+      ctx.moveTo(tr[i - 1].x, tr[i - 1].y);
+      ctx.lineTo(tr[i].x, tr[i].y);
+      ctx.lineWidth = 5 * f;
+      ctx.strokeStyle = `rgba(${rgb},${0.35 * f})`;
+      ctx.stroke();
+    }
+    const tg = info.target;
+    if (tg && Math.hypot(tg.x - x, tg.y - y) > R + 6) {
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(tg.x, tg.y);
+      ctx.setLineDash([2, 6]);
+      ctx.lineDashOffset = -t * 40;
+      ctx.lineWidth = 1.4;
+      ctx.strokeStyle = `rgba(${rgb},0.6)`;
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.lineDashOffset = 0;
+      ctx.beginPath();
+      ctx.arc(tg.x, tg.y, 4, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(${rgb},0.9)`;
+      ctx.fill();
+    }
+  } else {
+    tr.length = 0;
+  }
+
+  // as duas mãos no mesmo holograma: barra entre elas (girar e mudar o tamanho)
+  if (info.pair && h === hands[0]) {
+    const p2 = info.pair;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(p2.x, p2.y);
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = `rgba(${CYAN},0.55)`;
+    ctx.stroke();
+    const mx = (x + p2.x) / 2, my = (y + p2.y) / 2;
+    const ang = Math.atan2(p2.y - y, p2.x - x);
+    ctx.beginPath();
+    ctx.arc(mx, my, 11, ang - 1, ang + 1);
+    ctx.arc(mx, my, 11, ang + Math.PI - 1, ang + Math.PI + 1);
+    ctx.strokeStyle = `rgba(${CYAN},0.85)`;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    // marcas de régua ao longo da barra
+    const len = Math.hypot(p2.x - x, p2.y - y);
+    for (let d = 24; d < len - 24; d += 18) {
+      const qx = x + Math.cos(ang) * d, qy = y + Math.sin(ang) * d;
+      ctx.beginPath();
+      ctx.moveTo(qx - Math.sin(ang) * 3, qy + Math.cos(ang) * 3);
+      ctx.lineTo(qx + Math.sin(ang) * 3, qy - Math.cos(ang) * 3);
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = `rgba(${CYAN},0.4)`;
+      ctx.stroke();
     }
   }
 }

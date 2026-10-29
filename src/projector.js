@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { RoundedBoxGeometry } from '../vendor/three-addons/RoundedBoxGeometry.js';
 import { scene } from './stage.js';
+import { organicGeometry, tubeGeometry, latheGeometry, extrudeGeometry, gearGeometry, springGeometry, holoMaterial } from './shapes.js';
 
 // Projetor holográfico: transforma o JSON do JARVIS em modelos feitos de formas básicas.
 // Cada modelo "se imprime" de baixo para cima (plano de corte + anel de varredura + fantasma em
@@ -14,6 +15,11 @@ const box = new THREE.Box3();
 const size = new THREE.Vector3();
 const center = new THREE.Vector3();
 const tmp = new THREE.Vector3();
+
+// Formas desenhadas pelas próprias coordenadas (relativas a "pos"), sem esticar por "tam"
+const FREEFORM = new Set(['organico', 'curva', 'torno', 'extrusao', 'pronta']);
+// Aparelhos com pouca memória recebem superfícies orgânicas um pouco mais simples
+const LOW_END = (navigator.deviceMemory || 8) <= 4 || matchMedia('(max-width: 700px)').matches;
 
 export const normalize = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
 
@@ -30,10 +36,24 @@ function fitUnit(g) {
   return g;
 }
 
-function geometry(p) {
+function geometry(p, res) {
   const [w, h, d] = p.tam;
   let g;
   switch (p.forma) {
+    case 'organico':
+      return organicGeometry(p.bolas, p.bastoes, p.suave ?? 0.35, res);
+    case 'pronta':
+      return p.geo; // geometria já montada (modelos prontos de anatomia)
+    case 'curva':
+      return tubeGeometry(p.pontos, p.raio, p.raio_fim ?? p.raio);
+    case 'torno':
+      return latheGeometry(p.perfil);
+    case 'extrusao':
+      return extrudeGeometry(p.contorno, p.profundidade ?? 0.2);
+    case 'engrenagem':
+      return gearGeometry(Math.max(w, h), d, p.dentes ?? 16, p.furo ?? 0.25);
+    case 'mola':
+      return springGeometry(w, h, p.voltas ?? 6, p.fio ?? Math.min(w, h) * 0.06);
     case 'esfera':
       g = new THREE.SphereGeometry(0.5, 48, 32);
       break;
@@ -87,8 +107,15 @@ function geometry(p) {
 
 function material(p) {
   const color = new THREE.Color(p.cor);
-  const side = p.forma === 'semiesfera' || p.forma === 'tubo' ? THREE.DoubleSide : THREE.FrontSide;
+  const side = p.forma === 'semiesfera' || p.forma === 'tubo' || p.forma === 'torno' ? THREE.DoubleSide : THREE.FrontSide;
   switch (p.material) {
+    case 'holograma':
+      return holoMaterial(color);
+    case 'tecido':
+      // órgãos: aspecto úmido e macio
+      return new THREE.MeshPhysicalMaterial({ color, roughness: 0.45, metalness: 0, clearcoat: 0.55, clearcoatRoughness: 0.3, sheen: 0.25, sheenRoughness: 0.5, sheenColor: color.clone().lerp(new THREE.Color(0xffffff), 0.2), side });
+    case 'osso':
+      return new THREE.MeshStandardMaterial({ color, roughness: 0.7, metalness: 0, side });
     case 'metal':
       return new THREE.MeshStandardMaterial({ color, metalness: 0.9, roughness: 0.28, side });
     case 'vidro':
@@ -102,24 +129,39 @@ function material(p) {
   }
 }
 
-function buildPart(p, clipSolid, clipWire, wireMat) {
-  const geo = geometry(p);
+function buildPart(p, clipSolid, clipWire, wireMat, ghostMat, res) {
+  const geo = geometry(p, res);
   const mat = material(p);
   mat.clippingPlanes = [clipSolid];
   mat.clipShadows = true;
   const mesh = new THREE.Mesh(geo, mat);
-  mesh.castShadow = p.material !== 'luz' && p.material !== 'vidro';
-  mesh.receiveShadow = true;
+  mesh.castShadow = !['luz', 'vidro', 'holograma'].includes(p.material);
+  mesh.receiveShadow = p.material !== 'holograma';
+  if (p.material === 'holograma') mesh.renderOrder = 2; // a pele transparente por cima dos órgãos
   mesh.position.set(...p.pos);
+  // formas livres: a origem da peça vai para o centro dela (para separar, apontar e girar direito)
+  // (modelos prontos reaproveitam a geometria: o centro fica guardado nela)
+  if (FREEFORM.has(p.forma)) {
+    let c = geo.userData.center;
+    if (!c) {
+      geo.computeBoundingBox();
+      c = geo.boundingBox.getCenter(new THREE.Vector3());
+      geo.translate(-c.x, -c.y, -c.z);
+      geo.userData.center = c;
+    }
+    mesh.position.add(c);
+  }
   mesh.rotation.set(...p.rot.map(THREE.MathUtils.degToRad));
   mesh.name = p.nome;
   // ponto de chamada das etiquetas: anéis e tubos são apontados na borda, não no centro vazio
   const ring = p.forma === 'toro' || p.forma === 'tubo';
   const anchor = ring ? new THREE.Vector3(p.tam[0] / 2 - Math.min(p.tam[1], p.tam[0] * 0.45) / 2, 0, 0) : null;
   mesh.userData = { part: true, spin: p.giro * Math.PI * 2, p0: mesh.position.clone(), baseEmissive: mat.emissive?.clone(), baseIntensity: mat.emissiveIntensity, hl: 0, anchor };
-  // fantasma em arame (só durante a montagem)
-  const wire = new THREE.LineSegments(new THREE.EdgesGeometry(geo, 12), wireMat);
+  // fantasma em arame (só durante a montagem); superfícies lisas não têm quinas, então viram malha
+  const smooth = p.forma === 'organico' || p.forma === 'curva' || p.forma === 'mola' || p.forma === 'torno' || p.forma === 'pronta';
+  const wire = smooth ? new THREE.Mesh(geo, ghostMat) : new THREE.LineSegments(new THREE.EdgesGeometry(geo, 12), wireMat);
   wire.userData.wire = true;
+  wire.userData.sharedGeo = smooth;
   mesh.add(wire);
   if (p.orbita) {
     const pivot = new THREE.Group();
@@ -159,7 +201,12 @@ export class Projector {
   }
 
   describe() {
-    return this.models.map((m) => `${m.name}${m.userData.exploded ? ' (em vista explodida)' : ''} (peças: ${m.userData.partNames.slice(0, 24).join(', ')})`).join('; ');
+    return this.models.map((m) => {
+      const u = m.userData;
+      const names = [...new Set(u.partNames)];
+      const what = u.credit ? `modelo baixado do Sketchfab, ${u.credit}` : `peças: ${names.slice(0, 60).join(', ')}`;
+      return `${m.name}${u.exploded ? ' (em vista explodida)' : ''} (${what})`;
+    }).join('; ');
   }
 
   apply(cena, modelo) {
@@ -178,8 +225,12 @@ export class Projector {
     const clipSolid = new THREE.Plane(new THREE.Vector3(0, -1, 0), -100);
     const clipWire = new THREE.Plane(new THREE.Vector3(0, 1, 0), 100);
     const wireMat = new THREE.LineBasicMaterial({ color: ACCENT, transparent: true, opacity: 0.55, blending: THREE.AdditiveBlending, depthWrite: false, clippingPlanes: [clipWire] });
+    const ghostMat = new THREE.MeshBasicMaterial({ color: ACCENT, wireframe: true, transparent: true, opacity: 0.16, blending: THREE.AdditiveBlending, depthWrite: false, clippingPlanes: [clipWire] });
+    // quanto mais peças orgânicas, menos detalhe em cada uma (o total fica parecido)
+    const nOrg = modelo.partes.filter((p) => p.forma === 'organico').length;
+    const res = THREE.MathUtils.clamp(Math.cbrt(8 / Math.max(1, nOrg)), 0.6, 1) * (LOW_END ? 0.8 : 1);
     const inner = new THREE.Group();
-    for (const p of modelo.partes) inner.add(buildPart(p, clipSolid, clipWire, wireMat));
+    for (const p of modelo.partes) inner.add(buildPart(p, clipSolid, clipWire, wireMat, ghostMat, res));
     inner.updateMatrixWorld(true);
     box.setFromObject(inner);
     box.getSize(size);
@@ -204,7 +255,8 @@ export class Projector {
       build: 0,
       home: true,
       partNames: modelo.partes.map((p) => p.nome),
-      clipSolid, clipWire, wireMat, scan,
+      fonte: modelo.fonte || '',
+      clipSolid, clipWire, wireMat, ghostMat, scan,
       explode: 0, exploded: false,
       vel: null,
     };
@@ -257,6 +309,61 @@ export class Projector {
     this.lastTouch = performance.now();
   }
 
+  // ---------- Holograma de "carregando" (modelo pronto sendo montado ou baixado da internet) ----------
+  showLoader(nome, text) {
+    if (!this.loader) {
+      const g = new THREE.Group();
+      const lineMat = new THREE.LineBasicMaterial({ color: ACCENT, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false });
+      const shell = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.IcosahedronGeometry(0.75, 1)), lineMat);
+      const core = new THREE.Mesh(new THREE.IcosahedronGeometry(0.42, 3), holoMaterial(ACCENT, 0));
+      const ringMat = new THREE.MeshBasicMaterial({ color: ACCENT, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, toneMapped: false });
+      const rings = [1.05, 1.22].map((r, i) => {
+        const ring = new THREE.Mesh(new THREE.RingGeometry(r - 0.012, r, 96, 1, 0, Math.PI * (i ? 1.2 : 1.6)), ringMat);
+        ring.rotation.x = Math.PI / 2 + (i ? -0.5 : 0.35);
+        g.add(ring);
+        return ring;
+      });
+      g.add(shell, core);
+      g.userData = { shell, core, rings, lineMat, ringMat, k: 0, on: true, t: 0 };
+      g.scale.setScalar(0.001);
+      scene.add(g);
+      this.loader = g;
+    }
+    const u = this.loader.userData;
+    u.on = true;
+    u.nome = nome;
+    u.text = text;
+  }
+
+  hideLoader() {
+    if (this.loader) this.loader.userData.on = false;
+  }
+
+  updateLoader(dt) {
+    const g = this.loader;
+    if (!g) return;
+    const u = g.userData;
+    u.t += dt;
+    u.k += ((u.on ? 1 : 0) - u.k) * (1 - Math.exp(-dt * (u.on ? 6 : 10)));
+    if (!u.on && u.k < 0.01) {
+      scene.remove(g);
+      g.traverse((o) => { o.geometry?.dispose(); o.material?.dispose?.(); });
+      this.loader = null;
+      return;
+    }
+    g.position.set(this.centerX, this.centerY, 0);
+    g.scale.setScalar(0.4 + 0.6 * u.k);
+    u.shell.rotation.y += dt * 0.6;
+    u.shell.rotation.x += dt * 0.25;
+    u.rings[0].rotation.z += dt * 1.6;
+    u.rings[1].rotation.z -= dt * 1.1;
+    const pulse = 0.75 + 0.25 * Math.sin(u.t * 4);
+    u.lineMat.opacity = 0.55 * u.k * pulse;
+    u.ringMat.opacity = 0.8 * u.k;
+    u.core.material.uniforms.uOpacity.value = u.k;
+    u.core.material.uniforms.uGlow.value = 0.3 + 0.3 * Math.sin(u.t * 3);
+  }
+
   // ---------- Vista explodida ----------
   explode(on) {
     for (const m of this.models) m.userData.exploded = on;
@@ -278,8 +385,15 @@ export class Projector {
   }
 
   applyHighlight() {
-    // compara palavra por palavra, sem plural: "[Elétrons]" acende "Elétron 1" e "Elétron 2"
-    const stem = (w) => (w.length > 3 && w.endsWith('s') ? w.slice(0, -1) : w);
+    // compara palavra por palavra, sem plural: "[Elétrons]" acende "Elétron 1" e "Elétron 2",
+    // "[Pulmões]" acende os dois pulmões e "[Rins]" os dois rins
+    const stem = (w) => {
+      if (w.length > 3 && /[oa]es$/.test(w)) return w.slice(0, -3) + 'ao';
+      if (w.length > 4 && /[aeou]is$/.test(w)) return w.slice(0, -2) + 'l';
+      if (w.length > 3 && /[rz]es$/.test(w)) return w.slice(0, -2);
+      if (w.length > 3 && w.endsWith('s')) w = w.slice(0, -1);
+      return w.length > 2 ? w.replace(/[mn]$/, '') : w; // elétron/elétrons, rim/rins
+    };
     const words = (s) => s.split(' ').filter((w) => w && !/^\d+$/.test(w)).map(stem);
     const wanted = this.highlightNames.map(words);
     for (const p of this.parts()) {
@@ -304,6 +418,7 @@ export class Projector {
   // ---------- Quadro a quadro ----------
   update(dt) {
     this.t += dt;
+    this.updateLoader(dt);
     const idle = performance.now() - this.lastTouch > 3500;
     for (const m of this.models) {
       const u = m.userData;
@@ -360,7 +475,9 @@ export class Projector {
           // destaque: a peça pulsa na cor do JARVIS enquanto ele fala dela
           ou.hl += ((ou.hlOn ? 1 : 0) - ou.hl) * Math.min(1, dt * 8);
           const mat = o.material;
-          if (mat.emissive && (ou.hl > 0.01 || ou.hlWas)) {
+          if (mat.userData?.holo) {
+            mat.uniforms.uGlow.value = ou.hl * (0.6 + 0.4 * Math.sin(this.t * 6));
+          } else if (mat.emissive && (ou.hl > 0.01 || ou.hlWas)) {
             const pulse = ou.hl * (0.35 + 0.25 * Math.sin(this.t * 6));
             mat.emissive.copy(ou.baseEmissive).lerp(ACCENT, Math.min(1, pulse * 1.6));
             mat.emissiveIntensity = Math.max(ou.baseIntensity, pulse * 1.4);
@@ -386,6 +503,7 @@ export class Projector {
         u.scan.geometry.dispose();
         u.scan.material.dispose();
         u.wireMat.dispose();
+        u.ghostMat?.dispose();
         this.leaving = this.leaving.filter((x) => x !== m);
       } else {
         m.scale.setScalar(u.leaveScale * Math.max(0.001, u.leave));
@@ -400,7 +518,7 @@ export class Projector {
     u.scan.visible = false;
     const wires = [];
     m.traverse((o) => { if (o.userData.wire) wires.push(o); });
-    for (const w of wires) { w.parent.remove(w); w.geometry.dispose(); }
+    for (const w of wires) { w.parent.remove(w); if (!w.userData.sharedGeo) w.geometry.dispose(); }
     m.traverse((o) => { if (o.material && o.userData.part) { o.material.clippingPlanes = null; o.material.needsUpdate = true; } });
   }
 }
