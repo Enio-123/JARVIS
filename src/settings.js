@@ -10,6 +10,8 @@ const DEFAULTS = {
   name: '',
   wake: false,
   camera: true,
+  weather: true, // hora e clima de onde você está (pede a localização ao navegador)
+  sounds: true, // sons da interface
 };
 
 function load() {

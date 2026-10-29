@@ -3089,6 +3089,4 @@ var createPiperPhonemize = (() => {
     return moduleArg.ready;
   };
 })();
-export {
-  createPiperPhonemize
-};
+self.createPiperPhonemize = createPiperPhonemize;

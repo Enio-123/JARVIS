@@ -24,6 +24,9 @@ export class Ear {
     this.onUtterance = () => {};
     this.onLevel = () => {};
     this.onSpeechStart = () => {};
+    this.onSpeechEnd = () => {}; // trecho curto demais, descartado
+    this.sensitivity = 1; // > 1 exige voz mais alta (ex.: com música tocando)
+    this.maxMs = MAX_UTTERANCE_MS;
     this.floor = 0.004;
     this.level = 0;
     this._reset();
@@ -93,7 +96,7 @@ export class Ear {
     this.floor = Math.max(this.floor, 0.0015);
     if (!this.enabled) return;
 
-    const startT = Math.max(this.floor * 3.2, 0.012);
+    const startT = Math.max(this.floor * 3.2, 0.012) * this.sensitivity;
     const keepT = Math.max(this.floor * 2, 0.008);
 
     this.frames.push(f);
@@ -118,11 +121,12 @@ export class Ear {
     } else {
       this.silentMs += FRAME_MS;
     }
-    if (this.silentMs >= END_SILENCE_MS || this.totalMs >= MAX_UTTERANCE_MS) {
+    if (this.silentMs >= END_SILENCE_MS || this.totalMs >= this.maxMs) {
       const frames = this.frames;
       const voiced = this.voicedMs;
       this._reset();
       if (voiced >= MIN_SPEECH_MS) this.onUtterance(toWav(frames, this.ctx.sampleRate));
+      else this.onSpeechEnd();
     }
   }
 }

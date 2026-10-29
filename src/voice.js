@@ -1,30 +1,28 @@
 // Voz do JARVIS. Quatro motores, do mais realista ao mais simples:
+// - piper: Piper TTS (neural, pt-BR "faber") rodando num Worker; baixa 63 MB uma vez e guarda em cache
 // - eleven: ElevenLabs (nuvem, precisa de chave), voz pronta "Daniel" por padrão
-// - microsoft: vozes neurais "Natural" da Microsoft que o Edge expõe no speechSynthesis
-// - piper: Piper TTS rodando no navegador (ONNX), voz pt_BR "faber", baixada uma vez e guardada em cache
+// - microsoft: vozes neurais "Natural" que o Edge oferece
 // - sistema: melhor voz em português que o navegador tiver
+// A fala chega frase por frase (streaming): a próxima frase é sintetizada enquanto a atual toca.
 const PIPER_VOICE = {
-  id: 'pt_BR-faber-medium',
   url: 'https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx',
   size: 63,
 };
-const PIPER_CACHE = 'jarvisvoz-piper-v1';
-const base = new URL('../', import.meta.url);
+export const PIPER_CACHE = 'jarvisvoz-piper-v1';
 
 export const ENGINE_LABELS = {
-  auto: 'Automática (a melhor disponível)',
-  eleven: 'ElevenLabs (mais realista)',
-  microsoft: 'Microsoft neural (Edge)',
   piper: 'Piper Faber (neural, no navegador)',
+  eleven: 'ElevenLabs (a mais realista, precisa de chave)',
+  microsoft: 'Microsoft neural (Edge)',
   sistema: 'Voz do sistema',
+  auto: 'Automática (a melhor disponível)',
 };
 
-// Divide em frases para começar a falar antes de sintetizar tudo
+// Divide um texto pronto em frases
 export function sentences(text) {
   const parts = text.match(/[^.!?…]+[.!?…]+["')\]]*\s*|[^.!?…]+$/g) || [text];
   const out = [];
   for (const p of parts.map((s) => s.trim()).filter(Boolean)) {
-    // junta frases muito curtas com a anterior, para não picotar a entonação
     if (out.length && (p.length < 18 || out[out.length - 1].length < 18)) out[out.length - 1] += ' ' + p;
     else out.push(p);
   }
@@ -32,9 +30,8 @@ export function sentences(text) {
 }
 
 function waitVoices() {
-  const has = () => speechSynthesis.getVoices().length > 0;
   if (!('speechSynthesis' in window)) return Promise.resolve([]);
-  if (has()) return Promise.resolve(speechSynthesis.getVoices());
+  if (speechSynthesis.getVoices().length) return Promise.resolve(speechSynthesis.getVoices());
   return new Promise((resolve) => {
     const done = () => resolve(speechSynthesis.getVoices());
     speechSynthesis.addEventListener('voiceschanged', done, { once: true });
@@ -53,106 +50,59 @@ function pickSystem(voices) {
     || br.find((v) => !v.localService) || br[0] || voices.find((v) => /^pt/i.test(v.lang)) || null;
 }
 
-// ---------- Piper no navegador ----------
-class Piper {
+// ---------- Piper (no Worker) ----------
+class PiperClient {
   constructor() {
-    this.ready = null;
+    this.worker = null;
+    this.seq = 0;
+    this.pending = new Map();
+    this.loading = null;
     this.onProgress = () => {};
   }
 
-  async isCached() {
-    try {
-      const c = await caches.open(PIPER_CACHE);
-      return !!(await c.match(PIPER_VOICE.url)) && !!(await c.match(PIPER_VOICE.url + '.json'));
-    } catch { return false; }
+  _ensure() {
+    if (this.worker) return;
+    this.worker = new Worker(new URL('./piper-worker.js', import.meta.url));
+    this.worker.onmessage = (e) => {
+      const m = e.data;
+      if (m.type === 'progress') return this.onProgress(m.p);
+      if (m.type === 'ready') { this.loading?.resolve(); return; }
+      const p = this.pending.get(m.id);
+      if (m.type === 'audio' && p) { this.pending.delete(m.id); p.resolve(m); return; }
+      if (m.type === 'error') {
+        if (p) { this.pending.delete(m.id); p.reject(new Error(m.message)); } else this.loading?.reject(new Error(m.message));
+      }
+    };
+    this.worker.onerror = (e) => {
+      const err = new Error(e.message || 'Falha no motor da voz.');
+      this.loading?.reject(err);
+      for (const p of this.pending.values()) p.reject(err);
+      this.pending.clear();
+      this.worker = null;
+    };
   }
 
   load() {
-    this.ready ||= this._load().catch((e) => { this.ready = null; throw e; });
-    return this.ready;
-  }
-
-  async _fetchCached(url, progress) {
-    let cache = null;
-    try { cache = await caches.open(PIPER_CACHE); } catch { /* sem Cache API */ }
-    const hit = await cache?.match(url);
-    if (hit) return hit.arrayBuffer();
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`Não consegui baixar a voz (${res.status}).`);
-    const total = +res.headers.get('Content-Length') || 0;
-    const reader = res.body.getReader();
-    const chunks = [];
-    let got = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      got += value.length;
-      progress?.(total ? got / total : 0);
+    this._ensure();
+    if (!this.loading) {
+      let resolve, reject;
+      const promise = new Promise((a, b) => { resolve = a; reject = b; });
+      this.loading = { promise, resolve, reject };
+      promise.catch(() => { this.loading = null; });
+      this.worker.postMessage({ type: 'load', url: PIPER_VOICE.url });
     }
-    const blob = new Blob(chunks);
-    await cache?.put(url, new Response(blob)).catch(() => {});
-    return blob.arrayBuffer();
-  }
-
-  async _load() {
-    if (!window.ort) {
-      await new Promise((resolve, reject) => {
-        const s = document.createElement('script');
-        s.src = new URL('vendor/ort/ort.wasm.min.js', base).href;
-        s.onload = resolve;
-        s.onerror = () => reject(new Error('Falha ao carregar o motor da voz.'));
-        document.head.append(s);
-      });
-    }
-    const ort = window.ort;
-    ort.env.wasm.wasmPaths = new URL('vendor/ort/', base).href;
-    ort.env.wasm.numThreads = 1; // GitHub Pages não libera SharedArrayBuffer
-    const [{ createPiperPhonemize }, wasm, data, cfg] = await Promise.all([
-      import('../vendor/piper/piper_phonemize.mjs'),
-      fetch(new URL('vendor/piper/piper_phonemize.wasm', base)).then((r) => r.arrayBuffer()),
-      fetch(new URL('vendor/piper/piper_phonemize.data', base)).then((r) => r.arrayBuffer()),
-      this._fetchCached(PIPER_VOICE.url + '.json').then((b) => JSON.parse(new TextDecoder().decode(b))),
-    ]);
-    const model = await this._fetchCached(PIPER_VOICE.url, (p) => this.onProgress(p));
-    this.session = await ort.InferenceSession.create(model, { executionProviders: ['wasm'] });
-    Object.assign(this, { ort, createPiperPhonemize, wasm, data, cfg });
-  }
-
-  phonemize(text) {
-    return new Promise((resolve, reject) => {
-      let done = false;
-      this.createPiperPhonemize({
-        wasmBinary: this.wasm,
-        getPreloadedPackage: () => this.data.slice(0),
-        locateFile: (u) => new URL('vendor/piper/' + u.split('/').pop(), base).href,
-        print: (line) => {
-          if (done) return;
-          try { done = true; resolve(JSON.parse(line).phoneme_ids); } catch (e) { reject(e); }
-        },
-        printErr: () => {},
-      }).then((mod) => {
-        mod.callMain(['-l', this.cfg.espeak.voice, '--input', JSON.stringify([{ text }]), '--espeak_data', '/espeak-ng-data']);
-        if (!done) setTimeout(() => !done && reject(new Error('Falha ao converter o texto em fonemas.')), 3000);
-      }, reject);
-    });
+    return this.loading.promise;
   }
 
   async synth(text, ctx) {
-    await this.load();
-    const ids = await this.phonemize(text);
-    const { ort, cfg } = this;
-    const inf = cfg.inference || {};
-    const feeds = {
-      input: new ort.Tensor('int64', BigInt64Array.from(ids, BigInt), [1, ids.length]),
-      input_lengths: new ort.Tensor('int64', BigInt64Array.from([BigInt(ids.length)]), [1]),
-      scales: new ort.Tensor('float32', Float32Array.from([inf.noise_scale ?? 0.667, inf.length_scale ?? 1, inf.noise_w ?? 0.8]), [3]),
-    };
-    if (cfg.num_speakers > 1) feeds.sid = new ort.Tensor('int64', BigInt64Array.from([0n]), [1]);
-    const out = await this.session.run(feeds);
-    const pcm = out.output.data;
-    const buf = ctx.createBuffer(1, pcm.length, cfg.audio.sample_rate);
-    buf.copyToChannel(pcm, 0);
+    this._ensure();
+    const id = ++this.seq;
+    const m = await new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      this.worker.postMessage({ type: 'synth', url: PIPER_VOICE.url, id, text });
+    });
+    const buf = ctx.createBuffer(1, m.pcm.length, m.rate);
+    buf.copyToChannel(m.pcm, 0);
     return buf;
   }
 }
@@ -166,7 +116,7 @@ export async function elevenVoices(key) {
   return (body.voices || []).map((v) => ({ id: v.voice_id, name: v.name, desc: [v.labels?.accent, v.labels?.gender].filter(Boolean).join(', ') }));
 }
 
-async function elevenSynth(key, voiceId, text, ctx, prev, next) {
+async function elevenSynth(key, voiceId, text, ctx, prev) {
   const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`, {
     method: 'POST',
     headers: { 'xi-api-key': key, 'Content-Type': 'application/json', Accept: 'audio/mpeg' },
@@ -174,7 +124,6 @@ async function elevenSynth(key, voiceId, text, ctx, prev, next) {
       text,
       model_id: 'eleven_multilingual_v2',
       previous_text: prev || undefined,
-      next_text: next || undefined,
       voice_settings: { stability: 0.5, similarity_boost: 0.8, style: 0.15, use_speaker_boost: true },
     }),
   });
@@ -188,6 +137,8 @@ async function elevenSynth(key, voiceId, text, ctx, prev, next) {
   return ctx.decodeAudioData(await res.arrayBuffer());
 }
 
+const BUFFER_ENGINES = new Set(['piper', 'eleven']);
+
 // ---------- Voz ----------
 export class Voice {
   constructor(ctx) {
@@ -196,25 +147,31 @@ export class Voice {
     this.analyser.fftSize = 512;
     this.analyser.connect(ctx.destination);
     this.wave = new Float32Array(this.analyser.fftSize);
-    this.piper = new Piper();
+    this.piper = new PiperClient();
     this.voices = [];
     this.speakingNow = false;
+    this.mode = 'buffer';
     this.fake = 0;
     this.token = 0;
+    this.piperCached = false;
     this.onNote = () => {};
+    this.now = null; // frase que está tocando: { index, text, meta, start, duration, chars }
   }
 
   async init() {
     this.voices = await waitVoices();
-    this.piperCached = await this.piper.isCached();
+    try {
+      const c = await caches.open(PIPER_CACHE);
+      this.piperCached = !!(await c.match(PIPER_VOICE.url)) && !!(await c.match(PIPER_VOICE.url + '.json'));
+    } catch { this.piperCached = false; }
   }
 
   available(settings) {
     return {
+      piper: typeof WebAssembly === 'object' && typeof Worker === 'function',
       eleven: !!settings.elevenKey,
       microsoft: !!pickMicrosoft(this.voices),
-      piper: typeof WebAssembly === 'object',
-      sistema: !!pickSystem(this.voices) || 'speechSynthesis' in window,
+      sistema: 'speechSynthesis' in window,
     };
   }
 
@@ -244,61 +201,113 @@ export class Voice {
     return Math.min(1, Math.sqrt(s / this.wave.length) * 4);
   }
 
+  // Quanto da frase atual já foi falado (0 a 1), para a legenda acompanhar a voz
+  progress() {
+    const n = this.now;
+    if (!n) return 0;
+    if (n.boundary != null) return Math.min(1, n.boundary / Math.max(1, n.chars));
+    const d = n.duration || n.chars * 0.068;
+    const t = this.mode === 'speech' ? (performance.now() - n.start) / 1000 : this.ctx.currentTime - n.start;
+    return Math.max(0, Math.min(1, t / d));
+  }
+
   stop() {
     this.token++;
     try { this.source?.stop(); } catch { /* já parado */ }
     if ('speechSynthesis' in window) speechSynthesis.cancel();
     this.speakingNow = false;
-  }
-
-  // Fala o texto inteiro. Resolve quando termina (ou quando é interrompido).
-  async speak(text, settings) {
-    this.stop();
-    const token = ++this.token;
-    const parts = sentences(text);
-    if (!parts.length) return;
-    let engine = this.resolve(settings);
-
-    if (engine === 'piper' && !this.piperCached) {
-      // Enquanto a voz neural baixa, fala com a voz do sistema e prepara o Piper em segundo plano
-      this.preparePiper();
-      engine = 'sistema';
-    }
-
-    try {
-      if (engine === 'eleven') return await this._speakBuffers(token, parts, (t, i) =>
-        elevenSynth(settings.elevenKey, settings.elevenVoice, t, this.ctx, parts[i - 1], parts[i + 1]));
-      if (engine === 'piper') return await this._speakBuffers(token, parts, (t) => this.piper.synth(t, this.ctx));
-      return await this._speakSpeech(token, parts, engine === 'microsoft' ? pickMicrosoft(this.voices) : pickSystem(this.voices));
-    } catch (e) {
-      if (token !== this.token) return;
-      this.onNote(`${e.message} Usando a voz do sistema.`);
-      return this._speakSpeech(token, parts, pickSystem(this.voices));
-    }
+    this.now = null;
+    this.wakeQueue?.();
   }
 
   preparePiper() {
     if (this.piperLoading) return this.piperLoading;
-    this.piper.onProgress = (p) => this.onNote(`Baixando a voz neural (${PIPER_VOICE.size} MB, só na primeira vez): ${Math.round(p * 100)}%`);
+    this.piper.onProgress = (p) => this.onNote(`Baixando a voz do JARVIS (${PIPER_VOICE.size} MB, só na primeira vez): ${Math.round(p * 100)}%`);
     this.piperLoading = this.piper.load().then(
-      () => { this.piperCached = true; this.onNote(''); },
-      (e) => { this.onNote(`Voz neural indisponível: ${e.message}`); },
+      () => { this.piperCached = true; this.onNote(''); return true; },
+      (e) => {
+        this.piperFailedAt = performance.now();
+        this.onNote(`A voz neural não carregou (${e.message}). Usando a voz do sistema.`);
+        return false;
+      },
     ).finally(() => { this.piperLoading = null; });
     return this.piperLoading;
   }
 
-  async _speakBuffers(token, parts, synth) {
-    this.mode = 'buffer';
-    // sintetiza a próxima frase enquanto toca a atual
-    let next = synth(parts[0], 0);
-    for (let i = 0; i < parts.length; i++) {
-      const buf = await next;
-      if (token !== this.token) return;
-      if (i + 1 < parts.length) next = synth(parts[i + 1], i + 1);
-      await this._play(buf, token);
-      if (token !== this.token) return;
+  // Começa uma fala em streaming. push(texto) para cada frase; end() quando acabar.
+  begin(settings, handlers = {}) {
+    this.stop();
+    const token = ++this.token;
+    let engine = this.resolve(settings);
+    if (engine === 'piper' && !this.piperCached) {
+      // enquanto a voz neural baixa, fala com outra e prepara o Piper em segundo plano
+      // (se o download acabou de falhar, espera um pouco antes de tentar de novo)
+      if (!this.piperFailedAt || performance.now() - this.piperFailedAt > 120000) this.preparePiper();
+      engine = this.available(settings).microsoft ? 'microsoft' : 'sistema';
     }
-    this.speakingNow = false;
+    const items = [];
+    let ended = false;
+    const synth = (it, i) => {
+      const p = engine === 'eleven'
+        ? elevenSynth(settings.elevenKey, settings.elevenVoice, it.text, this.ctx, items[i - 1]?.text)
+        : this.piper.synth(it.text, this.ctx);
+      p.catch(() => {});
+      return p;
+    };
+    const sp = {
+      push: (text, meta) => {
+        if (token !== this.token || !text) return;
+        const it = { text, meta };
+        items.push(it);
+        if (BUFFER_ENGINES.has(engine)) it.audio = synth(it, items.length - 1);
+        this.wakeQueue?.();
+      },
+      end: () => { ended = true; this.wakeQueue?.(); },
+    };
+    sp.done = (async () => {
+      let i = 0;
+      while (token === this.token) {
+        if (i >= items.length) {
+          if (ended) break;
+          await new Promise((r) => { this.wakeQueue = r; });
+          this.wakeQueue = null;
+          continue;
+        }
+        const it = items[i];
+        try {
+          if (BUFFER_ENGINES.has(engine)) {
+            this.mode = 'buffer';
+            const buf = await (it.audio || (it.audio = synth(it, i)));
+            if (token !== this.token) break;
+            this.now = { index: i, text: it.text, meta: it.meta, start: this.ctx.currentTime, duration: buf.duration, chars: it.text.length };
+            handlers.onStart?.(i, it);
+            await this._play(buf, token);
+          } else {
+            this.mode = 'speech';
+            const voice = engine === 'microsoft' ? pickMicrosoft(this.voices) : pickSystem(this.voices);
+            this.now = { index: i, text: it.text, meta: it.meta, start: performance.now(), duration: null, chars: it.text.length, boundary: null };
+            handlers.onStart?.(i, it);
+            await this._utter(it.text, voice, token);
+          }
+          i++;
+        } catch (e) {
+          if (token !== this.token) break;
+          // falhou nesta frase: troca para a voz do sistema e repete a mesma frase
+          this.onNote(`${e.message} Usando a voz do sistema.`);
+          engine = 'sistema';
+        }
+      }
+      if (token === this.token) { this.speakingNow = false; this.now = null; }
+    })();
+    return sp;
+  }
+
+  // Atalho para falar um texto pronto
+  say(text, settings, handlers) {
+    const sp = this.begin(settings, handlers);
+    for (const s of sentences(text)) sp.push(s, { raw: s });
+    sp.end();
+    return sp.done;
   }
 
   _play(buf, token) {
@@ -314,23 +323,20 @@ export class Voice {
     });
   }
 
-  async _speakSpeech(token, parts, voice) {
-    if (!('speechSynthesis' in window)) throw new Error('Este navegador não tem voz.');
-    this.mode = 'speech';
-    for (const p of parts) {
-      if (token !== this.token) return;
-      await new Promise((resolve) => {
-        const u = new SpeechSynthesisUtterance(p);
-        u.lang = voice?.lang || 'pt-BR';
-        if (voice) u.voice = voice;
-        u.rate = 1.02;
-        // o Chrome às vezes não dispara onend; o tempo limite evita travar
-        const timer = setTimeout(resolve, 2500 + p.length * 120);
-        u.onend = u.onerror = () => { clearTimeout(timer); resolve(); };
-        this.speakingNow = true;
-        speechSynthesis.speak(u);
-      });
-    }
-    if (token === this.token) this.speakingNow = false;
+  _utter(text, voice, token) {
+    if (!('speechSynthesis' in window)) return Promise.reject(new Error('Este navegador não tem voz.'));
+    return new Promise((resolve) => {
+      if (token !== this.token) return resolve();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = voice?.lang || 'pt-BR';
+      if (voice) u.voice = voice;
+      u.rate = 1.02;
+      // o Chrome às vezes não dispara onend; o tempo limite evita travar
+      const timer = setTimeout(resolve, 2500 + text.length * 110);
+      u.onboundary = (e) => { if (this.now && token === this.token) this.now.boundary = e.charIndex + (e.charLength || 0); };
+      u.onend = u.onerror = () => { clearTimeout(timer); resolve(); };
+      this.speakingNow = true;
+      speechSynthesis.speak(u);
+    });
   }
 }

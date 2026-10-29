@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { RoomEnvironment } from '../vendor/three-addons/RoomEnvironment.js';
 
 // ---------- Renderizador, cena e câmera ----------
 export const canvas = document.getElementById('scene');
@@ -10,8 +11,13 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.05;
 renderer.setClearColor(0x000000, 0); // o fundo é o gradiente do CSS
+renderer.localClippingEnabled = true; // usado no efeito de montagem do holograma
 
 export const scene = new THREE.Scene();
+// Reflexos suaves de um "estúdio" para os materiais brilhantes e metálicos
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.04).texture;
+pmrem.dispose();
 
 export const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
 camera.position.set(0, 2.2, 8.4);
@@ -32,8 +38,8 @@ export function setView(pos, target, instant = false) {
 }
 
 // Luz principal quente, preenchimento frio e luz de contorno azul por trás
-scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x0a0c10, 0.75));
-const key = new THREE.DirectionalLight(0xfff4ea, 2.2);
+scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x0a0c10, 0.45));
+const key = new THREE.DirectionalLight(0xfff4ea, 1.8);
 key.position.set(3.5, 8, 6);
 key.castShadow = true;
 key.shadow.mapSize.set(2048, 2048);
@@ -51,25 +57,106 @@ floor.rotation.x = -Math.PI / 2;
 floor.receiveShadow = true;
 scene.add(floor);
 
-// Plataforma do projetor: anéis finos no chão, sob o modelo
+// Textura de HUD desenhada no próprio código: anéis, marcações e arcos no estilo das telas do Stark
+export function hudTexture(kind = 'platform') {
+  const S = 1024;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const g = c.getContext('2d');
+  g.translate(S / 2, S / 2);
+  g.strokeStyle = '#5cd0ff';
+  const R = S / 2 - 8;
+  const ring = (r, w, a, dash = []) => {
+    g.globalAlpha = a; g.lineWidth = w; g.setLineDash(dash);
+    g.beginPath(); g.arc(0, 0, r, 0, Math.PI * 2); g.stroke();
+  };
+  const arc = (r, w, a, from, to) => {
+    g.globalAlpha = a; g.lineWidth = w; g.setLineDash([]);
+    g.beginPath(); g.arc(0, 0, r, from, to); g.stroke();
+  };
+  const ticks = (r, len, n, w, a, every = 0, longLen = 0) => {
+    g.globalAlpha = a; g.lineWidth = w; g.setLineDash([]);
+    g.beginPath();
+    for (let i = 0; i < n; i++) {
+      const ang = (i / n) * Math.PI * 2;
+      const l = every && i % every === 0 ? longLen : len;
+      g.moveTo(Math.cos(ang) * r, Math.sin(ang) * r);
+      g.lineTo(Math.cos(ang) * (r - l), Math.sin(ang) * (r - l));
+    }
+    g.stroke();
+  };
+  if (kind === 'platform') {
+    ring(R, 3, 0.6);
+    ticks(R - 14, 10, 120, 2, 0.45, 10, 24);
+    arc(R - 54, 9, 0.55, 0.2, 1.3);
+    arc(R - 54, 9, 0.55, 2.3, 3.1);
+    arc(R - 54, 9, 0.55, 4.1, 5.6);
+    ring(R - 82, 2, 0.32, [14, 10]);
+    ring(R * 0.6, 2, 0.28);
+    ticks(R * 0.6, 9, 72, 2, 0.32);
+  } else {
+    ring(R, 3, 0.55);
+    ticks(R - 12, 12, 90, 2.5, 0.5, 15, 28);
+    arc(R - 50, 10, 0.6, -0.6, 0.6);
+    arc(R - 50, 10, 0.6, Math.PI - 0.6, Math.PI + 0.6);
+    ring(R - 76, 2, 0.3, [10, 12]);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 4;
+  return t;
+}
+
+export function glowTexture(rgba = '92,208,255') {
+  const c = document.createElement('canvas');
+  c.width = c.height = 256;
+  const g = c.getContext('2d');
+  const grd = g.createRadialGradient(128, 128, 0, 128, 128, 128);
+  grd.addColorStop(0, `rgba(${rgba},1)`);
+  grd.addColorStop(0.5, `rgba(${rgba},0.35)`);
+  grd.addColorStop(1, `rgba(${rgba},0)`);
+  g.fillStyle = grd;
+  g.fillRect(0, 0, 256, 256);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+// Plataforma do projetor: anéis de HUD no chão, sob o modelo
 export const platform = new THREE.Group();
-const ringMat = (o) => new THREE.MeshBasicMaterial({ color: 0x5cc8ff, transparent: true, opacity: o, depthWrite: false });
-[[1.55, 1.57, 0.35], [1.75, 1.76, 0.18], [2.2, 2.205, 0.1]].forEach(([a, b, o]) => {
-  const m = new THREE.Mesh(new THREE.RingGeometry(a, b, 128), ringMat(o));
-  m.rotation.x = -Math.PI / 2;
-  platform.add(m);
-});
-const disc = new THREE.Mesh(new THREE.CircleGeometry(1.55, 96), new THREE.MeshBasicMaterial({ color: 0x5cc8ff, transparent: true, opacity: 0.04, depthWrite: false }));
+const platMat = new THREE.MeshBasicMaterial({ map: hudTexture('platform'), transparent: true, opacity: 0.75, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false });
+const platRing = new THREE.Mesh(new THREE.PlaneGeometry(4.5, 4.5), platMat);
+platRing.rotation.x = -Math.PI / 2;
+platform.add(platRing);
+const discMat = new THREE.MeshBasicMaterial({ map: glowTexture(), transparent: true, opacity: 0.16, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false });
+const disc = new THREE.Mesh(new THREE.PlaneGeometry(3.4, 3.4), discMat);
 disc.rotation.x = -Math.PI / 2;
+disc.position.y = -0.002;
 platform.add(disc);
 platform.position.y = 0.01;
+platform.userData = { ring: platRing, ringMat: platMat, discMat };
 scene.add(platform);
 
 // Compatibilidade com o código das mãos (sem grade)
 export const grid = new THREE.Group();
 
-// Enquadramento que se adapta à tela (no celular em pé a câmera recua)
+// Enquadramento que se adapta à tela (no celular em pé a câmera recua).
+// "lift" move o ponto de mira: negativo faz o palco subir na tela (tela de início),
+// positivo faz descer (celular com o cartão de música no topo).
 export let portrait = false;
+let lift = 0;
+export function setLift(v) {
+  v = Math.round(v * 50) / 50;
+  if (v === lift) return;
+  lift = v;
+  resize();
+}
+
+// Quanto subir o ponto de mira para que um ponto na altura y (em z = 0) apareça abaixo da linha screenY
+export function liftFor(y, screenY) {
+  const k = innerHeight / 2 / (Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * viewPos.z);
+  return Math.max(0, y - (portrait ? 1.6 : 1.3) - (innerHeight / 2 - screenY) / k);
+}
 export function resize() {
   const w = innerWidth, h = innerHeight;
   renderer.setSize(w, h, false);
@@ -77,7 +164,7 @@ export function resize() {
   portrait = camera.aspect < 0.9;
   const halfW = portrait ? 2.6 : 4.6; // largura útil que precisa caber
   const dist = Math.max(8.4, halfW / (Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * camera.aspect) + 1.5);
-  setView([0, 2.2 + (dist - 8.4) * 0.12, dist], [0, portrait ? 1.6 : 1.3, 0]);
+  setView([0, 2.2 + (dist - 8.4) * 0.12, dist], [0, (portrait ? 1.6 : 1.3) + lift, 0]);
   camera.updateProjectionMatrix();
 }
 

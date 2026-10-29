@@ -287,31 +287,49 @@ export function drawHands() {
   const dpr = Math.min(devicePixelRatio, 2);
   octx.setTransform(dpr, 0, 0, dpr, 0, 0);
   octx.clearRect(0, 0, innerWidth, innerHeight);
+  const t = performance.now() / 1000;
   for (const h of hands) {
     if (!h.present || !h.pts) continue;
-    octx.strokeStyle = 'rgba(255,255,255,0.5)';
-    octx.lineWidth = 2;
+    // esqueleto da mão em azul, discreto, no estilo do HUD
+    octx.lineCap = 'round';
+    octx.strokeStyle = 'rgba(92,208,255,0.35)';
+    octx.lineWidth = 1.5;
     octx.beginPath();
     for (const [a, b] of BONES) {
       octx.moveTo(h.pts[a].x, h.pts[a].y);
       octx.lineTo(h.pts[b].x, h.pts[b].y);
     }
     octx.stroke();
-    octx.fillStyle = 'rgba(255,255,255,0.8)';
-    for (const p of h.pts) {
+    octx.fillStyle = 'rgba(190,236,255,0.8)';
+    h.pts.forEach((p, i) => {
       octx.beginPath();
-      octx.arc(p.x, p.y, 2.5, 0, Math.PI * 2);
+      octx.arc(p.x, p.y, i % 4 === 0 && i ? 3.2 : 2, 0, Math.PI * 2);
       octx.fill();
-    }
-    // Cursor da pinça: azul = indicador, âmbar = dedo médio
-    const color = h.pinchKind === 'middle' ? '#f2a541' : '#4c8dff';
-    octx.beginPath();
-    octx.arc(h.x, h.y, h.pinchKind ? 9 : 14, 0, Math.PI * 2);
+    });
+    // mira da pinça: azul = indicador (modelo), âmbar = dedo médio (peça)
+    const rgb = h.pinchKind === 'middle' ? '242,165,65' : '92,208,255';
+    octx.strokeStyle = `rgba(${rgb},0.95)`;
     octx.lineWidth = 2;
-    octx.strokeStyle = h.pinchKind ? color : 'rgba(255,255,255,0.9)';
-    octx.stroke();
     if (h.pinchKind) {
-      octx.fillStyle = h.pinchKind === 'middle' ? 'rgba(242,165,65,0.35)' : 'rgba(76,141,255,0.35)';
+      octx.fillStyle = `rgba(${rgb},0.3)`;
+      octx.beginPath();
+      octx.arc(h.x, h.y, 9, 0, Math.PI * 2);
+      octx.fill();
+      octx.stroke();
+      octx.lineWidth = 1;
+      octx.beginPath();
+      octx.arc(h.x, h.y, 16, 0, Math.PI * 2);
+      octx.stroke();
+    } else {
+      for (let k = 0; k < 3; k++) {
+        const a = t * 1.6 + (k * Math.PI * 2) / 3;
+        octx.beginPath();
+        octx.arc(h.x, h.y, 15, a, a + 1.25);
+        octx.stroke();
+      }
+      octx.beginPath();
+      octx.arc(h.x, h.y, 2.2, 0, Math.PI * 2);
+      octx.fillStyle = `rgba(${rgb},0.95)`;
       octx.fill();
     }
   }
