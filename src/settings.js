@@ -1,5 +1,5 @@
 // Configurações salvas só neste navegador (localStorage).
-// As chaves de API nunca saem daqui, a não ser para o próprio serviço (Groq / ElevenLabs).
+// As chaves de API nunca saem daqui, a não ser para o próprio serviço (Groq / ElevenLabs / Sketchfab).
 const KEY = 'jarvisvoz.settings';
 
 const DEFAULTS = {
@@ -7,6 +7,7 @@ const DEFAULTS = {
   voice: 'piper', // auto | eleven | microsoft | piper | sistema
   elevenKey: '',
   elevenVoice: 'onwK4e9ZLuTAKqWW03F9', // "Daniel", voz britânica pronta da ElevenLabs
+  sketchfabKey: '', // token da API do Sketchfab (opcional): busca modelos 3D prontos na internet
   name: '',
   wake: false,
   camera: true,

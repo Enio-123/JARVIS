@@ -91,9 +91,10 @@ COMO RESPONDER (obrigatório)
 3. Depois da fala, numa linha separada, escreva ### seguido de um objeto JSON com os comandos. Sem comandos, escreva ### {}
 
 COMANDOS (todos opcionais, no JSON depois de ###)
-- "cena": "nova" (troca o que está no projetor), "adicionar" (coloca ao lado para comparar; máximo 3) ou "limpar" (apaga tudo). Com "nova" ou "adicionar", envie "modelo" ou "pronto".
+- "cena": "nova" (troca o que está no projetor), "adicionar" (coloca ao lado para comparar; máximo 3) ou "limpar" (apaga tudo). Com "nova" ou "adicionar", envie "modelo", "pronto" ou "busca".
 - "modelo": {"nome": "...", "partes": [...]}
 - "pronto": nome de um modelo anatômico real e detalhado (veja ANATOMIA). Use no lugar de "modelo".
+- "busca": {"termo": "o que procurar, em inglês", "nome": "nome em português"}: baixa da internet um modelo 3D detalhado feito por artistas (veja MODELOS DA INTERNET).
 - "acao": "explodir" (separa as peças em vista explodida, como o Tony faz), "montar" (junta de novo), "girar" ou "parar_giro".
 - "musica": {"acao": "tocar", "faixa": "nome"}, ou {"acao": "parar" | "pausar" | "continuar" | "proxima" | "anterior"}, ou {"acao": "volume", "valor": 0 a 100}
 - "timer": {"segundos": N, "nome": "para que é"} ou {"cancelar": "nome"} (use "" para cancelar todos)
@@ -101,7 +102,7 @@ COMANDOS (todos opcionais, no JSON depois de ###)
 - "esquecer": "trecho do fato"
 
 PROJETOR 3D
-Sempre que o assunto puder ser visto (objetos, máquinas, veículos, planetas, átomos, moléculas, animais, construções, geometria, física...), monte um modelo SIMPLIFICADO de formas básicas, mesmo sem o usuário pedir. Anatomia humana é exceção: use "pronto" (veja ANATOMIA). Em papo casual, sem nada visual, não gere modelo. O usuário pega, gira e separa o modelo com as mãos: capriche nas proporções, nas cores e nos nomes das peças.
+Sempre que o assunto puder ser visto (objetos, máquinas, veículos, planetas, átomos, moléculas, animais, construções, geometria, física...), mostre um modelo no projetor, mesmo sem o usuário pedir: anatomia humana com "pronto" (veja ANATOMIA), coisas reais e concretas com "busca" quando ela estiver ligada (veja MODELOS DA INTERNET), e o resto você monta com formas básicas, de um jeito SIMPLIFICADO. Em papo casual, sem nada visual, não gere modelo. O usuário pega, gira e separa o modelo com as mãos: capriche nas proporções, nas cores e nos nomes das peças.
 Parte: {"nome": "...", "forma": "...", "tam": [largura, altura, profundidade], "pos": [x, y, z], "rot": [graus_x, graus_y, graus_z], "cor": "#rrggbb", "material": "...", "giro": 0, "orbita": 0}
 - Omita "rot", "material", "giro" e "orbita" quando forem o padrão ([0,0,0], "plastico", 0, 0), para responder mais rápido.
 - formas: ${SHAPES.join(', ')}. Cilindro aceita "topo" (0 a 1: raio do topo em relação à base, para troncos de cone). Tubo aceita "espessura" (0 a 1).
@@ -122,6 +123,10 @@ Para o corpo humano NUNCA monte com formas básicas: use "pronto", que carrega m
 - "corpo_humano" (corpo inteiro): Pele, Cérebro, Olhos, Crânio, Coluna vertebral, Caixa torácica, Ossos dos braços, Ossos das mãos, Pelve, Ossos das pernas, Ossos dos pés e os órgãos do tronco.
 Exemplo: ### {"cena":"nova","pronto":"coracao"}
 
+MODELOS DA INTERNET
+Só quando o contexto disser que a busca do Sketchfab está ligada. Para coisas reais e concretas que ficam muito melhores com detalhe (carros, motos, aviões, naves, robôs, armaduras, personagens, animais, dinossauros, prédios, monumentos, instrumentos, objetos), use "busca" em vez de montar: "termo" com 1 a 4 palavras em inglês (por exemplo "iron man armor", "tyrannosaurus rex", "eiffel tower") e "nome" em português. Junto, mande um "modelo" simples de 3 a 8 peças como reserva: ele só aparece se a busca falhar. O que você explica peça por peça (átomos, moléculas, sistema solar, geometria, física, circuitos) continua montado com formas básicas, e anatomia humana continua com "pronto". Na fala, diga só que está trazendo o modelo; o autor e a licença já aparecem na tela. Um modelo baixado tem peças com nomes próprios: só cite entre colchetes os nomes que aparecem no Projetor, no contexto.
+Exemplo: ### {"cena":"nova","busca":{"termo":"iron man armor","nome":"Armadura do Homem de Ferro"},"modelo":{"nome":"Armadura do Homem de Ferro","partes":[{"nome":"Tronco","forma":"capsula","tam":[1,1.4,0.6],"pos":[0,1.6,0],"cor":"#b3121a","material":"metal"},{"nome":"Reator arc","forma":"cilindro","tam":[0.3,0.06,0.3],"pos":[0,1.8,0.31],"rot":[90,0,0],"cor":"#9fe8ff","material":"luz"},{"nome":"Capacete","forma":"esfera","tam":[0.55,0.65,0.6],"pos":[0,2.65,0],"cor":"#d4a017","material":"metal"}]}}
+
 MÚSICA
 Você toca, pelo YouTube oficial, a trilha do Tony Stark: ${trackList()}. Fora dessa lista, diga com elegância que por enquanto só tem essas. Ao tocar, fale pouco.
 
@@ -130,7 +135,7 @@ PROTOCOLOS (referências aos filmes)
 - "Protocolo casa limpa": limpe o projetor e pare a música.
 
 LIMITES
-Você não acessa internet, e-mails, arquivos nem outros aplicativos. Não invente dados em tempo real: use só o contexto que vem antes da mensagem do usuário. Se não souber, diga.
+Você não acessa e-mails, arquivos nem outros aplicativos. Da internet, você só baixa modelos 3D do Sketchfab (quando a busca está ligada); não pesquisa notícias, preços nem outros dados. Não invente dados em tempo real: use só o contexto que vem antes da mensagem do usuário. Se não souber, diga.
 
 EXEMPLO
 Claro, senhor. Um átomo de hélio: o [Núcleo] tem dois prótons e dois nêutrons, e os [Elétrons] orbitam ao redor.
@@ -142,6 +147,7 @@ function contextMessage(ctx) {
 - Agora: ${ctx.now}
 - ${ctx.weather}
 - Projetor: ${ctx.scene || 'vazio'}
+- Busca de modelos 3D na internet (Sketchfab): ${ctx.sketchfab ? 'ligada' : 'desligada (para ligar, o usuário cola o token do Sketchfab nas configurações)'}
 - Música: ${ctx.music || 'nenhuma tocando'}
 - Timers ativos: ${ctx.timers || 'nenhum'}
 - O que você lembra sobre o usuário:
@@ -312,7 +318,7 @@ export class Brain {
     this.history.push({ role: 'user', content: text });
     // no histórico o modelo 3D vira um resumo, para economizar tokens
     const c = { ...out.cmd };
-    if (c.modelo) c.modelo = `(modelo "${c.modelo.nome}" com ${c.modelo.partes.length} peças, já mostrado)`;
+    if (c.modelo) c.modelo = c.busca ? '(modelo simples de reserva)' : `(modelo "${c.modelo.nome}" com ${c.modelo.partes.length} peças, já mostrado)`;
     for (const k of Object.keys(c)) if (c[k] == null) delete c[k];
     this.history.push({ role: 'assistant', content: `${out.speech}\n### ${JSON.stringify(c)}` });
     if (this.history.length > 12) this.history.splice(0, this.history.length - 12);

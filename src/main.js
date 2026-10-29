@@ -359,6 +359,7 @@ function context() {
     music: t ? `${t.title}, ${t.artist} (${music.state === 'paused' ? 'pausada' : 'tocando'})` : '',
     timers: timers.describe(),
     memory: memory.describe(),
+    sketchfab: !!settings.sketchfabKey,
   };
 }
 
@@ -412,12 +413,15 @@ async function failSpeak(e) {
 
 // ---------- Comandos que vêm junto da resposta ----------
 let loadSeq = 0; // cada pedido novo de cena cancela um modelo que ainda estava carregando
+let searchAbort = null;
 
 function applyCommands(c) {
   if (c.cena) {
     const my = ++loadSeq;
     projector.hideLoader();
+    searchAbort?.abort();
     if (c.pronto) loadPrefab(c.pronto, c.cena, my);
+    else if (c.busca) loadSearch(c.busca, c.cena, c.modelo, my);
     else shown(projector.apply(c.cena, c.modelo), c.cena);
   }
   if (c.acao === 'explodir') projector.explode(true);
@@ -463,6 +467,44 @@ async function loadPrefab(name, cena, my) {
   projector.hideLoader();
   if (!modelo) { note('Não consegui montar esse modelo.', 6000, true); return; }
   shown(projector.apply(cena, modelo), cena);
+}
+
+// Modelos prontos da internet (Sketchfab), baixados com o token da pessoa. O módulo só carrega no
+// primeiro uso. Se a busca falhar, entra o modelo simples de reserva que o JARVIS mandou junto.
+const sketchfab = () => import('./sketchfab.js');
+const SEARCH_PHASE = { Procurando: 'Procurando no Sketchfab', Abrindo: 'Abrindo o modelo' };
+
+async function loadSearch(busca, cena, reserva, my) {
+  const fallback = () => { if (reserva) shown(projector.apply(cena, reserva), cena); };
+  if (!settings.sketchfabKey) {
+    if (!reserva) note('Para buscar modelos na internet, cole o token do Sketchfab nas configurações.', 9000);
+    fallback();
+    return;
+  }
+  const ac = (searchAbort = new AbortController());
+  let modelo = null;
+  let erro = '';
+  projector.showLoader(busca.nome, SEARCH_PHASE.Procurando);
+  try {
+    const sk = await sketchfab();
+    try {
+      modelo = await sk.findModel(busca, settings.sketchfabKey, (k, fase) => {
+        if (my === loadSeq) projector.showLoader(busca.nome, SEARCH_PHASE[fase] || `${fase} ${Math.round(k * 100)}%`);
+      }, ac.signal);
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      console.warn(e);
+      erro = e instanceof sk.SketchfabError ? e.message : 'Não consegui abrir o modelo baixado.';
+    }
+  } catch (e) {
+    console.warn(e);
+    erro = 'Não consegui carregar a busca de modelos. Verifique a internet.';
+  }
+  if (my !== loadSeq) return;
+  projector.hideLoader();
+  if (modelo) { shown(projector.apply(cena, modelo), cena); return; }
+  note(erro || `Não achei um modelo pronto de ${busca.nome} para baixar.`, 9000, !!erro);
+  fallback();
 }
 
 // ---------- Timers ----------
@@ -1062,6 +1104,12 @@ function setText(el, text) {
   if (el.textContent !== text) el.textContent = text;
 }
 
+// x da etiqueta na tela, sem deixar ela passar da borda (os créditos dos modelos baixados são compridos)
+function labelX(el, sx) {
+  const half = Math.max(90, el.offsetWidth / 2 + 12);
+  return Math.min(innerWidth - half, Math.max(half, sx));
+}
+
 function updateHud() {
   for (const m of projector.models) {
     let el = modelLabels.get(m);
@@ -1078,7 +1126,7 @@ function updateHud() {
     wp.copy(m.position);
     wp.y += (u.height * (1 + u.explode * 0.8) * m.scale.x) / 2 + 0.3;
     const s = toScreen(wp);
-    const x = Math.min(innerWidth - 90, Math.max(90, s.x));
+    const x = labelX(el, s.x);
     const y = Math.max(narrow.matches ? 150 : 120, s.y);
     el.style.transform = `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px) translate(-50%, -100%)`;
     // some se cair atrás do cartão de música
@@ -1105,7 +1153,7 @@ function updateHud() {
     wp.copy(ld.position);
     wp.y += 1.35 * ld.scale.x;
     const s = toScreen(wp);
-    el.style.transform = `translate(${Math.min(innerWidth - 90, Math.max(90, s.x)).toFixed(1)}px, ${Math.max(narrow.matches ? 150 : 120, s.y).toFixed(1)}px) translate(-50%, -100%)`;
+    el.style.transform = `translate(${labelX(el, s.x).toFixed(1)}px, ${Math.max(narrow.matches ? 150 : 120, s.y).toFixed(1)}px) translate(-50%, -100%)`;
     el.style.opacity = ld.userData.on ? '' : '0';
   }
   for (const [m, el] of modelLabels) {
@@ -1229,6 +1277,9 @@ function renderMemory() {
 
 $('btnSettings').addEventListener('click', () => {
   $('setGroq').value = settings.groqKey;
+  $('setSketchfab').value = settings.sketchfabKey;
+  $('sketchfabResult').textContent = '';
+  $('sketchfabResult').className = 'result';
   $('setEleven').value = settings.elevenKey;
   $('setName').value = settings.name;
   $('setWake').checked = settings.wake;
@@ -1262,6 +1313,22 @@ $('btnTestGroq').addEventListener('click', async () => {
   } catch (e) {
     r.className = 'result err';
     r.textContent = e.message;
+  }
+});
+
+$('btnTestSketchfab').addEventListener('click', async () => {
+  const r = $('sketchfabResult');
+  const token = $('setSketchfab').value.trim();
+  if (!token) { r.className = 'result err'; r.textContent = 'Cole o token primeiro.'; return; }
+  r.className = 'result';
+  r.textContent = 'Testando...';
+  try {
+    const conta = await (await sketchfab()).checkToken(token);
+    r.className = 'result ok';
+    r.textContent = `Funciona. Conta: ${conta}.`;
+  } catch (e) {
+    r.className = 'result err';
+    r.textContent = e.message || 'Não consegui testar agora.';
   }
 });
 
@@ -1321,6 +1388,20 @@ $('btnSaveSettings').addEventListener('click', async () => {
       return;
     }
   }
+  // token do Sketchfab: vazio desliga a busca; um token recusado não é salvo
+  const skToken = $('setSketchfab').value.trim();
+  if (skToken && skToken !== settings.sketchfabKey) {
+    try {
+      await (await sketchfab()).checkToken(skToken);
+    } catch (e) {
+      if (e.status === 401 || e.status === 403) {
+        $('sketchfabResult').className = 'result err';
+        $('sketchfabResult').textContent = e.message;
+        return;
+      }
+    }
+  }
+  patch.sketchfabKey = skToken;
   const weatherOn = patch.weather && !settings.weather;
   save(patch);
   if (sfx) sfx.enabled = settings.sounds;
@@ -1331,10 +1412,11 @@ $('btnSaveSettings').addEventListener('click', async () => {
 });
 
 $('btnWipe').addEventListener('click', async () => {
-  if (!confirm('Apagar as chaves, as configurações, a memória e a voz baixada deste navegador?')) return;
+  if (!confirm('Apagar as chaves, as configurações, a memória, a voz e os modelos baixados deste navegador?')) return;
   wipe();
   memory.clear();
   try { await caches.delete(PIPER_CACHE); } catch { /* sem Cache API */ }
+  try { await (await sketchfab()).clearModels(); } catch { /* sem Cache API */ }
   location.reload();
 });
 

@@ -125,7 +125,8 @@
   .mlabel.show { opacity: 1; }
   .mlabel b { display: block; font-family: var(--hud); font-weight: 400; font-size: 11px; letter-spacing: 0.22em; color: var(--accent);
     text-transform: uppercase; text-shadow: 0 0 12px rgba(92, 208, 255, 0.45); }
-  .mlabel span { display: block; font-size: 11px; color: var(--muted); margin-top: 3px; }
+  .mlabel span { display: block; font-size: 11px; color: var(--muted); margin: 3px auto 0; white-space: normal; text-wrap: balance;
+    max-width: min(460px, calc(100vw - 32px)); }
   .mlabel::after { content: ""; display: block; width: 1px; height: 14px; margin: 6px auto 0;
     background: linear-gradient(var(--accent), transparent); opacity: 0.7; }
   .callout { position: absolute; left: 0; top: 0; padding: 4px 10px; border-radius: 6px; font-size: 12px; white-space: nowrap;
@@ -369,6 +370,15 @@
         <button id="btnTestGroq">Testar</button>
       </div>
       <div class="result" id="groqResult"></div>
+    </div>
+    <div class="field">
+      <label for="setSketchfab">Token do Sketchfab (opcional)</label>
+      <div class="inline">
+        <input type="password" id="setSketchfab" autocomplete="off" spellcheck="false" placeholder="Token da API">
+        <button id="btnTestSketchfab">Testar</button>
+      </div>
+      <small>Com ele, o JARVIS baixa modelos 3D detalhados feitos por artistas. Crie uma conta grátis e copie o token em <a href="https://sketchfab.com/settings/password" target="_blank" rel="noopener">sketchfab.com, Settings, Password &amp; API</a>. Ele fica só neste navegador; não mostre para ninguém.</small>
+      <div class="result" id="sketchfabResult"></div>
     </div>
 
     <div class="section">Voz</div>

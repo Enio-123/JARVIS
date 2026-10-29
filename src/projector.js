@@ -106,6 +106,7 @@ function geometry(p, res) {
 }
 
 function material(p) {
+  if (p.mat) return p.mat.clone(); // material que veio junto do modelo baixado
   const color = new THREE.Color(p.cor);
   const side = p.forma === 'semiesfera' || p.forma === 'tubo' || p.forma === 'torno' ? THREE.DoubleSide : THREE.FrontSide;
   switch (p.material) {
@@ -127,6 +128,12 @@ function material(p) {
     default:
       return new THREE.MeshPhysicalMaterial({ color, roughness: 0.4, metalness: 0, clearcoat: 0.35, clearcoatRoughness: 0.3, side });
   }
+}
+
+// Libera o material e as texturas dele (modelos baixados vêm com texturas)
+function disposeMaterial(mat) {
+  for (const v of Object.values(mat)) if (v?.isTexture) v.dispose();
+  mat.dispose();
 }
 
 function buildPart(p, clipSolid, clipWire, wireMat, ghostMat, res) {
@@ -158,11 +165,14 @@ function buildPart(p, clipSolid, clipWire, wireMat, ghostMat, res) {
   const anchor = ring ? new THREE.Vector3(p.tam[0] / 2 - Math.min(p.tam[1], p.tam[0] * 0.45) / 2, 0, 0) : null;
   mesh.userData = { part: true, spin: p.giro * Math.PI * 2, p0: mesh.position.clone(), baseEmissive: mat.emissive?.clone(), baseIntensity: mat.emissiveIntensity, hl: 0, anchor };
   // fantasma em arame (só durante a montagem); superfícies lisas não têm quinas, então viram malha
+  // (malhas enormes de modelos baixados ficam sem fantasma: montar o arame delas pesa demais)
   const smooth = p.forma === 'organico' || p.forma === 'curva' || p.forma === 'mola' || p.forma === 'torno' || p.forma === 'pronta';
-  const wire = smooth ? new THREE.Mesh(geo, ghostMat) : new THREE.LineSegments(new THREE.EdgesGeometry(geo, 12), wireMat);
-  wire.userData.wire = true;
-  wire.userData.sharedGeo = smooth;
-  mesh.add(wire);
+  if (!(p.mat && (geo.index?.count || 0) > 600000)) {
+    const wire = smooth ? new THREE.Mesh(geo, ghostMat) : new THREE.LineSegments(new THREE.EdgesGeometry(geo, 12), wireMat);
+    wire.userData.wire = true;
+    wire.userData.sharedGeo = smooth;
+    mesh.add(wire);
+  }
   if (p.orbita) {
     const pivot = new THREE.Group();
     pivot.userData.orbit = p.orbita * Math.PI * 2;
@@ -204,7 +214,9 @@ export class Projector {
     return this.models.map((m) => {
       const u = m.userData;
       const names = [...new Set(u.partNames)];
-      const what = u.credit ? `modelo baixado do Sketchfab, ${u.credit}` : `peças: ${names.slice(0, 60).join(', ')}`;
+      const named = names.filter((n) => !/^Peça \d+$/.test(n));
+      const what = !u.credit ? `peças: ${names.slice(0, 60).join(', ')}`
+        : `modelo baixado do Sketchfab, ${u.credit}; ${named.length ? `peças: ${named.slice(0, 30).join(', ')}` : 'peças sem nome'}`;
       return `${m.name}${u.exploded ? ' (em vista explodida)' : ''} (${what})`;
     }).join('; ');
   }
@@ -256,6 +268,7 @@ export class Projector {
       home: true,
       partNames: modelo.partes.map((p) => p.nome),
       fonte: modelo.fonte || '',
+      credit: modelo.credito || '',
       clipSolid, clipWire, wireMat, ghostMat, scan,
       explode: 0, exploded: false,
       vel: null,
@@ -499,7 +512,7 @@ export class Projector {
       if (u.leave <= 0) {
         scene.remove(m);
         scene.remove(u.scan);
-        m.traverse((o) => { o.geometry?.dispose(); o.material?.dispose?.(); });
+        m.traverse((o) => { o.geometry?.dispose(); if (o.material) disposeMaterial(o.material); });
         u.scan.geometry.dispose();
         u.scan.material.dispose();
         u.wireMat.dispose();
