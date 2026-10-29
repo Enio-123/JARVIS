@@ -1,6 +1,6 @@
 # J.A.R.V.I.S.
 
-Assistente por voz no navegador, inspirado no JARVIS do Homem de Ferro. Você fala, ele responde com voz e, quando o assunto pode ser visto, mostra um holograma 3D que você pega, gira e desmonta com as mãos pela câmera.
+Assistente por voz no navegador, inspirado no JARVIS do Homem de Ferro. Você fala, ele responde com voz e, quando o assunto pode ser visto, mostra um holograma 3D que você gira, aproxima e desmonta com as mãos pela câmera.
 
 Site: https://enio-123.github.io/JARVIS/
 
@@ -23,16 +23,17 @@ Site: https://enio-123.github.io/JARVIS/
 - **Protocolos dos filmes**: "protocolo festa em casa" e "protocolo casa limpa".
 
 ## Gestos
-- A mão aparece na tela como um holograma: a mira trava no que está embaixo dela, o arco entre o polegar e o indicador mostra a pinça fechando e uma linha liga a mão ao que ela está segurando
-- **Pinça** (polegar + indicador): pega e move o holograma; girar o pulso gira
-- **Pinça rápida**: separa as peças (vista explodida) ou junta de novo
-- **Pinça com o dedo médio**: pega uma peça
-- **Duas mãos**: giram e mudam o tamanho
-- **Arremessar**: descarta o holograma
-- Sem câmera: mouse (arrastar = mover, clique = separar, botão direito = peça, rodinha = tamanho) ou o dedo na tela (dois dedos giram e mudam o tamanho)
+O holograma fica parado no lugar; você só gira e aproxima, como uma câmera em volta dele. Os gestos são só mão aberta e mão fechada, que qualquer webcam reconhece bem.
+- **Mão fechada** (punho): segure e mexa a mão para girar o holograma para os lados e inclinar. Soltar com a mão em movimento deixa ele girando um pouco
+- **Duas mãos fechadas**: afaste as mãos para aproximar, junte para afastar
+- **Fechar e abrir a mão rápido**: separa as peças (vista explodida) ou junta de novo
+- A mão aparece na tela como um holograma: o arco no centro da palma enche conforme ela fecha, setas mostram que dá para girar e, com as duas mãos, uma barra mostra o zoom
+- Se a mão fechada não for reconhecida, use **Treinar mão** nas configurações (mão aberta e mão fechada, 2 segundos cada)
+- Por voz: "Jarvis, aproxima", "afasta", "separa as peças", "para de girar"
+- Sem câmera: arrastar com o mouse ou o dedo gira, rodinha ou dois dedos aproximam, clique ou toque separa as peças, botão direito puxa uma peça
 
 ## Atalhos
-Espaço interrompe a fala, M pausa o microfone, C liga ou desliga a câmera.
+Espaço interrompe a fala, M pausa o microfone, C liga ou desliga a câmera, Delete limpa o holograma.
 
 ## Voz
 - **Piper Faber** (padrão): voz neural pt-BR que roda no navegador, num Worker; baixa 63 MB na primeira vez e fica em cache

@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { canvas, renderer, scene, camera, resize, updateCamera, raycast, pointAt, toScreen, depthOf, platform, portrait, setLift, liftFor } from './stage.js';
+import { canvas, renderer, scene, camera, resize, updateCamera, raycast, pointAt, toScreen, platform, portrait, setLift, liftFor } from './stage.js';
 import * as hands from './hands.js';
 import { GrabSystem } from './grab.js';
 import { Projector } from './projector.js';
@@ -43,7 +43,6 @@ const timers = new Timers(onTimer, renderTimers);
 const announcements = [];
 
 const FOLLOW_UP_MS = 12000; // depois de uma resposta, dá para continuar sem dizer "Jarvis"
-const FLING_PX = 1500; // velocidade da mão/mouse (pixels por segundo) que conta como "jogar fora"
 const WAKE = /\b(j[aáe]rv[iíe][sz]|jarvas|javis|jarbas|djarvis)\b/i;
 // Depois de "Jarvis", estas palavras só pedem para ele parar (não viram pergunta)
 const STOP = /^(para|pare|parar|pera|espera|chega|basta|sil[eê]ncio|cala|quiet[oa]|ok|okay|obrigad[oa]|valeu|beleza|tudo bem|j[aá] (deu|chega|entendi|sei)|pode parar|entendi|t[aá] bom)\b/i;
@@ -428,6 +427,8 @@ function applyCommands(c) {
   else if (c.acao === 'montar') projector.explode(false);
   else if (c.acao === 'girar') { projector.autoSpin = true; projector.lastTouch = 0; }
   else if (c.acao === 'parar_giro') projector.autoSpin = false;
+  else if (c.acao === 'aproximar') projector.zoomBy(1.5);
+  else if (c.acao === 'afastar') projector.zoomBy(1 / 1.5);
   if (c.musica) {
     music.handle(c.musica).then(() => {
       if (c.musica.acao !== 'tocar' && c.musica.acao !== 'proxima' && c.musica.acao !== 'anterior') return;
@@ -782,6 +783,7 @@ addEventListener('keydown', (e) => {
   if (e.target.closest('button')) return;
   if (e.code === 'KeyM') toggleMic();
   else if (e.code === 'KeyC') $('btnCam').click();
+  else if ((e.code === 'Delete' || e.code === 'Backspace') && projector.models.length) shown(projector.apply('limpar'), 'limpar');
 });
 addEventListener('keyup', (e) => {
   if (e.code === 'Space' && state !== 'off' && e.target.closest('button') && !document.querySelector('.modal.show:not(.start)')) e.preventDefault();
@@ -848,18 +850,28 @@ function updateHint() {
   el.hidden = !projector.models.length || narrow.matches || performance.now() > hintUntil;
   if (el.hidden) return;
   el.innerHTML = hands.isCameraOn()
-    ? '<b>Pinça</b> pega o holograma · <b>pinça rápida</b> separa as peças<br><b>Pinça com o dedo médio</b> pega uma peça<br><b>Duas mãos</b> giram e mudam o tamanho<br><b>Arremesse</b> para descartar'
-    : '<b>Arraste</b> para mover · <b>clique</b> separa as peças<br><b>Botão direito</b> pega uma peça · <b>rodinha</b> muda o tamanho<br><b>Arremesse</b> para descartar';
+    ? '<b>Feche a mão</b> e mova para girar<br><b>Duas mãos fechadas</b>: afaste para aproximar, junte para afastar<br><b>Feche e abra rápido</b> para separar as peças'
+    : '<b>Arraste</b> para girar · <b>rodinha</b> aproxima e afasta<br><b>Clique</b> separa as peças · <b>botão direito</b> puxa uma peça';
 }
 narrow.addEventListener?.('change', updateHint);
 
-// ---------- Pegar hologramas e peças ----------
-const grab = new GrabSystem(projector.models, { gravity: false, pickRadius: 150, minDepth: 3, maxDepth: 14 });
+// ---------- Girar e aproximar os hologramas ----------
+// Movimentos simples, iguais para a mão, o mouse e o dedo. O holograma fica no lugar; a pessoa só
+// gira e aproxima, como uma câmera em volta dele:
+// - mão fechada (ou arrastar o mouse / o dedo): gira para os lados e inclina
+// - duas mãos fechadas (ou dois dedos): afastar aproxima, juntar afasta
+// - fechar e abrir a mão rápido (ou clicar / tocar): separa as peças, ou junta de novo
+// - botão direito do mouse: puxa uma peça para fora
+const TURN_K = 1.25 * Math.PI; // arrastar o lado menor da tela inteiro = pouco mais de meia volta
+const MIN_SPIN = 1.2; // rad/s: abaixo disso, soltar não deixa o holograma girando sozinho
+const holds = new Map(); // quem segura -> { m, x, y, track: [{ t, yaw, tilt }] }
+let zoomPair = null; // { a, b, m, d0, z0 }
 const partGrab = new GrabSystem([], { gravity: false, twoHand: false, minDepth: 2.5, maxDepth: 14 });
-const heldParts = new Map(); // grabber -> { part, parent }
+const heldParts = new Map(); // mouse -> { part, parent }
 
 projector.onRemove = (m) => {
-  grab.forget(m);
+  for (const [g, h] of [...holds]) if (h.m === m) holds.delete(g);
+  if (zoomPair?.m === m) zoomPair = null;
   // peça solta na mão de alguém cujo modelo sumiu: some junto
   for (const [g, h] of [...heldParts]) {
     let o = h.parent;
@@ -891,39 +903,98 @@ function modelOf(o) {
   return o || null;
 }
 
-// Rastro recente de cada mão/mouse, para medir a velocidade do arremesso
-const trails = new WeakMap();
-function trackPointer(g, now = performance.now()) {
-  let tr = trails.get(g);
-  if (!tr) trails.set(g, (tr = []));
-  tr.push({ t: now, x: g.x, y: g.y });
-  while (tr.length > 2 && now - tr[0].t > 150) tr.shift();
+// O holograma que vai girar: o que está embaixo da mão, ou o mais perto dela na horizontal
+// (não precisa mirar: com um holograma só, a mão fechada em qualquer lugar gira ele)
+function modelAt(x, y) {
+  const hit = raycast(x, y, projector.models, true);
+  if (hit) return modelOf(hit.object);
+  let best = null, bestD = Infinity;
+  for (const m of projector.models) {
+    const d = Math.abs(toScreen(m.position).x - x);
+    if (d < bestD) { bestD = d; best = m; }
+  }
+  return best;
 }
 
-function flingVelocity(g, m, now) {
-  const tr = trails.get(g);
-  if (!tr?.length) return null;
-  const old = tr.find((p) => now - p.t <= 130) || tr[tr.length - 1];
-  const dt = (now - old.t) / 1000;
-  if (dt < 0.02) return null;
-  if (Math.hypot(g.x - old.x, g.y - old.y) / dt < FLING_PX) return null;
-  const d = depthOf(m.position);
-  return pointAt(g.x, g.y, d, new THREE.Vector3()).sub(pointAt(old.x, old.y, d, new THREE.Vector3())).divideScalar(dt);
-}
+const pairDist = (a, b) => Math.max(60, Math.hypot(a.x - b.x, a.y - b.y));
+const inPair = (g) => zoomPair && (zoomPair.a === g || zoomPair.b === g);
 
-// t: horário do evento (o do próprio evento do mouse, que continua certo mesmo se a página estiver lenta)
-function pinchStart(g, kind, t = performance.now()) {
+function holdStart(g, t = performance.now()) {
   projector.touched();
   g.downAt = t;
   g.downX = g.x;
   g.downY = g.y;
-  trails.set(g, [{ t: g.downAt, x: g.x, y: g.y }]);
-  if (kind === 'index') {
-    grab.objects = projector.models;
-    if (grab.grab(g)) return;
-    if (g.kind === 'hand' && hitsRobot(g.x, g.y)) robotTouch();
+  // a outra mão (ou outro dedo) já segura um holograma: esta entra no zoom dele, esteja onde estiver
+  const first = zoomPair ? null : [...holds.keys()].find((o) => o.kind === g.kind);
+  if (!first && hitsRobot(g.x, g.y)) { robotTouch(); return; }
+  const m = first ? holds.get(first).m : modelAt(g.x, g.y);
+  if (!m) return;
+  const u = m.userData;
+  u.held = (u.held || 0) + 1;
+  u.vyaw = u.vtilt = 0;
+  holds.set(g, { m, x: g.x, y: g.y, track: [{ t, yaw: u.yaw, tilt: u.tilt }] });
+  if (first) zoomPair = { a: first, b: g, m, d0: pairDist(g, first), z0: u.zoom };
+}
+
+function holdMove(g, t = performance.now()) {
+  const h = holds.get(g);
+  if (!h) return;
+  const dx = g.x - h.x, dy = g.y - h.y;
+  h.x = g.x;
+  h.y = g.y;
+  if (inPair(g)) {
+    projector.zoomTo(zoomPair.m, zoomPair.z0 * (pairDist(zoomPair.a, zoomPair.b) / zoomPair.d0));
     return;
   }
+  if (!dx && !dy) return;
+  const k = TURN_K / Math.min(innerWidth, innerHeight);
+  projector.turn(h.m, dx * k, dy * k);
+  const u = h.m.userData;
+  h.track.push({ t, yaw: u.yaw, tilt: u.tilt });
+  while (h.track.length > 2 && t - h.track[0].t > 120) h.track.shift();
+}
+
+// t = quando soltou (para a mão: quando ela começou a abrir); cancel = a mão sumiu da câmera ou o
+// toque foi cancelado, então não separa as peças nem embala
+function holdEnd(g, t = performance.now(), cancel = false) {
+  projector.touched();
+  const h = holds.get(g);
+  if (!h) return;
+  holds.delete(g);
+  const m = h.m;
+  const u = m.userData;
+  u.held = Math.max(0, (u.held || 1) - 1);
+  if (inPair(g)) {
+    // sobrou uma mão (ou um dedo) segurando: ela continua girando de onde está
+    const rest = zoomPair.a === g ? zoomPair.b : zoomPair.a;
+    zoomPair = null;
+    const r = holds.get(rest);
+    if (r) Object.assign(r, { x: rest.x, y: rest.y, track: [{ t, yaw: u.yaw, tilt: u.tilt }] });
+    return;
+  }
+  if (cancel) return;
+  const hand = g.kind === 'hand';
+  const quick = t - g.downAt < (hand ? 420 : 320) && Math.hypot(g.x - g.downX, g.y - g.downY) < (hand ? 28 : 12);
+  if (quick) {
+    // fechar e abrir rápido / clique: separa as peças (ou junta de novo)
+    u.exploded = !u.exploded;
+    u.home = true;
+    sfx?.ack();
+    return;
+  }
+  // embalo: continua com a velocidade dos últimos instantes e para sozinho (soltar devagar não embala)
+  const a = h.track[0], b = h.track[h.track.length - 1];
+  const dt = (b.t - a.t) / 1000;
+  if (dt < 0.03 || t - b.t > 90) return;
+  const vyaw = (b.yaw - a.yaw) / dt, vtilt = (b.tilt - a.tilt) / dt;
+  if (Math.hypot(vyaw, vtilt) > MIN_SPIN) projector.setSpin(m, vyaw, vtilt);
+}
+
+hands.onGrip((h, t) => holdStart(h, t), (h, t, lost) => holdEnd(h, t, lost));
+
+// Botão direito do mouse: puxa uma peça para fora do holograma
+function partStart(g) {
+  projector.touched();
   const hit = raycast(g.x, g.y, projector.parts(), false);
   if (!hit) return;
   const part = hit.object;
@@ -935,29 +1006,8 @@ function pinchStart(g, kind, t = performance.now()) {
   else { parent.attach(part); part.userData.held = 0; }
 }
 
-function pinchEnd(g, kind, t = performance.now()) {
+function partEnd(g) {
   projector.touched();
-  const quick = t - (g.downAt || 0) < 320 && Math.hypot(g.x - g.downX, g.y - g.downY) < 14;
-  if (kind === 'index') {
-    trackPointer(g, t);
-    const m = grab.grips.get(g)?.obj;
-    const paired = m && grab.pairs.has(m);
-    grab.release(g, false);
-    if (!m || paired || m.userData.held) return;
-    if (quick) {
-      // toque rápido: separa as peças (ou junta de novo)
-      m.userData.exploded = !m.userData.exploded;
-      m.userData.home = true;
-      sfx?.ack();
-      return;
-    }
-    const vel = flingVelocity(g, m, t);
-    if (vel) {
-      projector.fling(m, vel);
-      sfx?.dismiss();
-    }
-    return;
-  }
   const h = heldParts.get(g);
   if (!h) return;
   partGrab.release(g, false);
@@ -967,36 +1017,35 @@ function pinchEnd(g, kind, t = performance.now()) {
   projector.partMoved(h.part);
 }
 
-hands.onPinch(pinchStart, pinchEnd);
-
 // O que cada mão está fazendo, para o desenho da mão na tela
 const handTmp = new THREE.Vector3();
 function handInfo(h) {
-  const m = grab.heldBy(h);
-  const part = heldParts.get(h)?.part;
-  const obj = m || part;
-  let target = null, pair = null;
-  if (obj) {
-    const s = toScreen(obj.getWorldPosition(handTmp));
+  const hold = holds.get(h);
+  let target = null, pair = null, zoom = 0;
+  if (hold) {
+    const s = toScreen(hold.m.getWorldPosition(handTmp));
     if (!s.behind) target = s;
+    if (inPair(h)) {
+      const other = zoomPair.a === h ? zoomPair.b : zoomPair.a;
+      if (other.present) {
+        pair = { x: other.x, y: other.y };
+        zoom = hold.m.userData.zoom;
+      }
+    }
   }
-  if (m && grab.pairs.has(m)) {
-    const other = hands.hands.find((o) => o !== h && o.present && grab.heldBy(o) === m);
-    if (other) pair = { x: other.x, y: other.y };
-  }
-  return { hold: m ? 'model' : part ? 'part' : null, target, hover: !!h.hover, pair };
+  return { hold: hold ? 'model' : null, target, hover: !!h.hover, pair, zoom };
 }
 
-// Mouse e toque: esquerdo/dedo = pinça (holograma), direito = dedo médio (peça), rodinha = tamanho.
-// Dois dedos no mesmo holograma giram e mudam o tamanho, como as duas mãos.
-const mouse = { kind: 'mouse', present: false, x: -1, y: -1, size: 0, roll: undefined, pinchKind: null };
+// Mouse e toque: arrastar gira, dois dedos aproximam, clique ou toque separa as peças,
+// botão direito puxa uma peça, rodinha aproxima
+const mouse = { kind: 'mouse', present: false, x: -1, y: -1, size: 0, roll: undefined, down: null };
 const touches = new Map();
 
 function pointerOf(e) {
   if (e.pointerType === 'mouse') return mouse;
   let g = touches.get(e.pointerId);
   if (!g) {
-    g = { kind: 'touch', present: true, x: e.clientX, y: e.clientY, size: 0, roll: undefined, pinchKind: null };
+    g = { kind: 'touch', present: true, x: e.clientX, y: e.clientY, size: 0, roll: undefined, down: null };
     touches.set(e.pointerId, g);
   }
   return g;
@@ -1006,11 +1055,11 @@ canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 canvas.addEventListener('pointerdown', (e) => {
   const g = pointerOf(e);
   Object.assign(g, { x: e.clientX, y: e.clientY, present: true });
-  if (g.pinchKind) return;
-  if (hitsRobot(e.clientX, e.clientY)) { robotTouch(); return; }
-  g.pinchKind = e.button === 2 ? 'middle' : 'index';
+  if (g.down) return;
+  g.down = e.button === 2 ? 'part' : 'turn';
   try { canvas.setPointerCapture(e.pointerId); } catch { /* ponteiro já liberado */ }
-  pinchStart(g, g.pinchKind, e.timeStamp);
+  if (g.down === 'part') partStart(g);
+  else holdStart(g, e.timeStamp);
 });
 canvas.addEventListener('pointermove', (e) => {
   const g = e.pointerType === 'mouse' ? mouse : touches.get(e.pointerId);
@@ -1018,31 +1067,29 @@ canvas.addEventListener('pointermove', (e) => {
   g.x = e.clientX;
   g.y = e.clientY;
   if (g === mouse) mouse.present = true;
-  if (g.pinchKind) trackPointer(g, e.timeStamp);
+  if (g.down === 'turn') holdMove(g, e.timeStamp);
 });
 const endPointer = (e) => {
   const g = e.pointerType === 'mouse' ? mouse : touches.get(e.pointerId);
   if (!g) return;
-  if (g.pinchKind) {
-    const k = g.pinchKind;
-    g.pinchKind = null;
+  if (g.down) {
+    const k = g.down;
+    g.down = null;
     g.x = e.clientX;
     g.y = e.clientY;
-    pinchEnd(g, k, e.timeStamp);
+    if (k === 'turn') holdEnd(g, e.timeStamp, e.type === 'pointercancel');
+    else partEnd(g);
   }
   if (g !== mouse) { g.present = false; touches.delete(e.pointerId); }
 };
 canvas.addEventListener('pointerup', endPointer);
 canvas.addEventListener('pointercancel', endPointer);
-canvas.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse' && !mouse.pinchKind) mouse.present = false; });
+canvas.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse' && !mouse.down) mouse.present = false; });
 canvas.addEventListener('wheel', (e) => {
-  const hit = raycast(e.clientX, e.clientY, projector.models, true);
-  const o = hit && modelOf(hit.object);
+  const o = modelAt(e.clientX, e.clientY);
   if (!o || o.userData.build < 1) return;
   e.preventDefault();
-  projector.touched();
-  const base = o.userData.base;
-  o.scale.setScalar(THREE.MathUtils.clamp(o.scale.x * Math.exp(-e.deltaY * 0.001), base * 0.3, base * 3));
+  projector.zoomTo(o, o.userData.zoom * Math.exp(-e.deltaY * 0.0015));
 }, { passive: false });
 
 function pointers() {
@@ -1055,10 +1102,10 @@ function pointers() {
 // Nome da peça sob a mão (ou o mouse) e carinho no robô
 const tag = $('tag');
 function updateHover() {
-  const free = pointers().filter((g) => !g.pinchKind && g.kind !== 'touch');
+  const free = pointers().filter((g) => !g.down && !g.grip && g.kind !== 'touch');
   let pet = false;
   let shown = false;
-  for (const h of hands.hands) if (h.pinchKind || !h.present) h.hover = false;
+  for (const h of hands.hands) if (h.grip || !h.present) h.hover = false;
   for (const g of free) {
     if (!pet && hitsRobot(g.x, g.y)) pet = true;
     const hit = projector.models.length ? raycast(g.x, g.y, projector.parts(), false) : null;
@@ -1436,7 +1483,7 @@ $('btnCalib').addEventListener('click', async () => {
       $('calibText').textContent = text;
       bar.style.width = Math.round(progress * 100) + '%';
     }, calibAbort.signal);
-    $('calibText').textContent = 'Pronto. Sua pinça foi calibrada e fica salva neste navegador.';
+    $('calibText').textContent = 'Pronto. Sua mão foi calibrada e isso fica salvo neste navegador.';
     bar.style.width = '100%';
   } catch (e) {
     if (calibAbort.signal.aborted) { calibDlg.classList.remove('show'); return; }
@@ -1540,8 +1587,7 @@ function frame() {
   const t = clock.elapsedTime;
   frameNo++;
   hands.detect();
-  for (const h of hands.hands) if (h.present && h.pinchKind) trackPointer(h);
-  grab.update(dt);
+  for (const h of hands.hands) if (h.present && h.grip) holdMove(h, h.lastSeen * 1000);
   partGrab.update(dt);
   projector.update(dt);
   updateCamera(dt);
@@ -1562,7 +1608,8 @@ requestAnimationFrame(frame);
 // Ganchos só para testes automatizados (?debug)
 if (debug) {
   window.__jarvis = {
-    projector, brain, hands, mouse, camera, settings, jarvis, grab, partGrab, music, timers, memory, world,
+    projector, brain, hands, mouse, camera, settings, jarvis, holds, partGrab, music, timers, memory, world,
+    holdStart: (g, t) => holdStart(g, t), holdMove: (g, t) => holdMove(g, t), holdEnd: (g, t, c) => holdEnd(g, t, c),
     get voice() { return voice; },
     get ear() { return ear; },
     get sfx() { return sfx; },

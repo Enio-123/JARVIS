@@ -1,9 +1,13 @@
 // Câmera + rastreamento das mãos (MediaPipe Hand Landmarker)
-// Melhorias de detecção:
+// Gestos simples, que funcionam com qualquer webcam: mão fechada (punho) segura o holograma e mão
+// aberta solta. Para isso ficar confiável:
+// - o quanto a mão está fechada vem do ângulo das juntas dos dedos em 3D (coordenadas do mundo da
+//   mão), então funciona com a mão de lado, perto ou longe da câmera
+// - o "cursor" é o centro da palma, que quase não se mexe quando a mão fecha ou abre
 // - filtro One Euro em cada ponto da mão (tira o tremido sem deixar lento)
-// - pinça medida em 3D (coordenadas do mundo da mão), então funciona com a mão de lado ou longe
+// - histerese e alguns quadros de confirmação para fechar e para abrir (não solta sem querer)
 // - tolerância a perdas curtas: se a mão some por menos de 250 ms, nada é solto
-// - calibração: aprende a sua mão aberta e a sua pinça e ajusta os limites
+// - calibração opcional: aprende a sua mão aberta e o seu punho
 const video = document.getElementById('video');
 const overlay = document.getElementById('hands');
 const octx = overlay.getContext('2d');
@@ -13,9 +17,11 @@ let stream = null;
 let lastVideoTime = -1;
 let calibrating = false;
 const LOST_GRACE = 0.25;
+const GRIP_ON = 0.55; // fração do caminho entre a mão aberta e o punho que conta como "fechou"
+const GRIP_OFF = 0.35; // e como "abriu"
 
-const CALIB_KEY = 'jarvisvoz.calib';
-const DEFAULT_CALIB = { on: 0.3, off: 0.45, custom: false };
+const CALIB_KEY = 'jarvisvoz.calib2';
+const DEFAULT_CALIB = { open: 0.6, fist: 3.6, custom: false }; // dobra média dos dedos, em radianos
 export const calib = { ...DEFAULT_CALIB, ...loadCalib() };
 
 function loadCalib() {
@@ -28,6 +34,7 @@ export function resetCalib() {
   Object.assign(calib, DEFAULT_CALIB);
   try { localStorage.removeItem(CALIB_KEY); } catch { /* sem armazenamento */ }
 }
+const gripLevel = (f) => calib.open + (calib.fist - calib.open) * f;
 
 // ---------- Filtro One Euro ----------
 class OneEuro {
@@ -54,8 +61,8 @@ class OneEuro {
 function newHand(id) {
   return {
     kind: 'hand', id, present: false, lastSeen: 0,
-    x: 0, y: 0, tipX: 0, tipY: 0, size: 0, roll: 0,
-    ri: 1, rm: 1, pinchKind: null, offCount: 0, pts: null,
+    x: 0, y: 0, size: 0,
+    curl: 0, front: 0, grip: false, onCount: 0, offCount: 0, pts: null,
     vis: { appearAt: 0, snapAt: -9, releaseAt: -9, hoverAt: -9, hover: false, ghost: null, lostAt: 0, trail: [] },
     fx: Array.from({ length: 21 }, () => new OneEuro()),
     fy: Array.from({ length: 21 }, () => new OneEuro()),
@@ -64,7 +71,7 @@ function newHand(id) {
 export const hands = [newHand(0), newHand(1)];
 
 const handlers = { start: () => {}, end: () => {} };
-export function onPinch(start, end) {
+export function onGrip(start, end) {
   handlers.start = start;
   handlers.end = end;
 }
@@ -80,64 +87,75 @@ function toScreen(lm) {
   return { x: (1 - lm.x) * vw * s - ox, y: lm.y * vh * s - oy };
 }
 
-const dist3 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, (a.z || 0) - (b.z || 0));
+// Ângulo (radianos) entre dois segmentos seguidos: 0 = reto
+function bend(a, b, c) {
+  const ux = b.x - a.x, uy = b.y - a.y, uz = (b.z || 0) - (a.z || 0);
+  const vx = c.x - b.x, vy = c.y - b.y, vz = (c.z || 0) - (b.z || 0);
+  const d = Math.hypot(ux, uy, uz) * Math.hypot(vx, vy, vz) || 1;
+  return Math.acos(Math.max(-1, Math.min(1, (ux * vx + uy * vy + uz * vz) / d)));
+}
+
+// Dobra de cada dedo (indicador, médio, anelar, mínimo): soma dos ângulos das três juntas
+const FINGER_JOINTS = [[5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], [17, 18, 19, 20]];
+function curls(w) {
+  return FINGER_JOINTS.map(([m, p, d, t]) => bend(w[0], w[m], w[p]) + bend(w[m], w[p], w[d]) + bend(w[p], w[d], w[t]));
+}
 
 function readHand(landmarks, world) {
   const raw = landmarks.map(toScreen);
   const w = world && world.length === 21 ? world : landmarks;
-  const palm = dist3(w[0], w[9]) || 1;
+  const c = curls(w);
   const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
   return {
     raw,
     wx: raw[0].x, wy: raw[0].y,
-    ri: dist3(w[4], w[8]) / palm,
-    rm: dist3(w[4], w[12]) / palm,
+    curl: (c[0] + c[1] + c[2] + c[3]) / 4,
+    front: Math.min(c[0], c[1]), // indicador e médio (apontar com o dedo não conta como mão fechada)
     size: Math.hypot((landmarks[9].x - landmarks[0].x) * vw, (landmarks[9].y - landmarks[0].y) * vh) / vh,
   };
 }
 
-const mid = (p, a, b) => ({ x: (p[a].x + p[b].x) / 2, y: (p[a].y + p[b].y) / 2 });
-
+// Centro da palma: punho e base dos dedos (fica parado quando a mão fecha)
+const PALM_CENTER = [0, 5, 9, 13, 17];
 function setPoint(h) {
-  const m = h.pinchKind === 'middle' ? mid(h.pts, 4, 12) : mid(h.pts, 4, 8);
-  h.x = m.x;
-  h.y = m.y;
+  let x = 0, y = 0;
+  for (const i of PALM_CENTER) { x += h.pts[i].x; y += h.pts[i].y; }
+  h.x = x / PALM_CENTER.length;
+  h.y = y / PALM_CENTER.length;
 }
 
-function updatePinch(h) {
+// Fecha com 2 quadros seguidos acima do limite e abre com 3 quadros seguidos abaixo
+// (t = hora do quadro da câmera, em segundos)
+function updateGrip(h, t) {
   if (calibrating) return;
-  if (!h.pinchKind) {
-    if (Math.min(h.ri, h.rm) < calib.on) {
-      h.pinchKind = h.ri <= h.rm * 1.15 ? 'index' : 'middle';
+  if (!h.grip) {
+    const closed = h.curl >= gripLevel(GRIP_ON) && h.front >= gripLevel(GRIP_OFF);
+    h.onCount = closed ? h.onCount + 1 : 0;
+    if (h.onCount >= 2) {
+      h.grip = true;
       h.offCount = 0;
-      setPoint(h);
       h.vis.snapAt = performance.now() / 1000;
       h.vis.trail.length = 0;
-      handlers.start(h, h.pinchKind);
+      handlers.start(h, t * 1000);
     }
     return;
   }
-  const r = h.pinchKind === 'index' ? h.ri : h.rm;
-  if (r > calib.off) {
-    // precisa de 2 quadros seguidos abertos para soltar (evita soltar sem querer)
-    if (++h.offCount >= 2) {
-      const k = h.pinchKind;
-      h.pinchKind = null;
-      h.vis.releaseAt = performance.now() / 1000;
-      h.vis.releaseKind = k;
-      handlers.end(h, k);
-    }
-  } else {
-    h.offCount = 0;
-  }
+  if (h.curl > gripLevel(GRIP_OFF)) h.offCount = 0;
+  else if (++h.offCount === 1) h.openAt = t; // quando a mão começou a abrir
+  if (h.offCount >= 3) release(h, h.openAt);
+}
+
+// t = quando a mão abriu (s); lost = a mão sumiu ou a câmera parou (não conta como gesto)
+function release(h, t, lost = false) {
+  if (!h.grip) return;
+  h.grip = false;
+  h.onCount = 0;
+  h.vis.releaseAt = performance.now() / 1000;
+  handlers.end(h, t * 1000, lost);
 }
 
 function lose(h) {
-  if (h.pinchKind) {
-    const k = h.pinchKind;
-    h.pinchKind = null;
-    handlers.end(h, k);
-  }
+  release(h, h.lastSeen, true);
   // a mão some aos poucos em vez de desaparecer de uma vez
   if (h.pts) {
     h.vis.ghost = { pts: h.pts, size: h.size, x: h.x, y: h.y };
@@ -166,6 +184,8 @@ function assign(dets, t) {
       h.fx.forEach((f) => f.reset());
       h.fy.forEach((f) => f.reset());
       h.size = d.size;
+      h.curl = d.curl;
+      h.front = d.front;
       // mão nova na câmera: animação de "mão detectada"
       if (t - h.vis.lostAt > 0.6) h.vis.appearAt = t;
       h.vis.ghost = null;
@@ -174,13 +194,10 @@ function assign(dets, t) {
     h.lastSeen = t;
     h.pts = d.raw.map((p, k) => ({ x: h.fx[k].filter(p.x, t), y: h.fy[k].filter(p.y, t) }));
     h.size += (d.size - h.size) * 0.35;
-    h.roll = Math.atan2(h.pts[17].y - h.pts[5].y, h.pts[17].x - h.pts[5].x);
-    h.ri = d.ri;
-    h.rm = d.rm;
-    h.tipX = h.pts[8].x;
-    h.tipY = h.pts[8].y;
+    h.curl += (d.curl - h.curl) * 0.5;
+    h.front += (d.front - h.front) * 0.5;
     setPoint(h);
-    updatePinch(h);
+    updateGrip(h, t);
   });
   for (const h of hands) {
     if (used.has(h) || !h.present) continue;
@@ -236,7 +253,7 @@ export function stopCamera() {
   stream = null;
   video.srcObject = null;
   lastVideoTime = -1;
-  hands.forEach(lose);
+  hands.forEach((h) => lose(h));
 }
 
 // ---------- Calibração ("treinar" a sua mão) ----------
@@ -267,30 +284,30 @@ function collect(key, seconds, onProgress, signal) {
 }
 
 export async function calibrate(onStep, signal) {
-  hands.forEach((h) => { if (h.pinchKind) { const k = h.pinchKind; h.pinchKind = null; handlers.end(h, k); } });
+  hands.forEach((h) => release(h, h.lastSeen, true));
   calibrating = true;
   try {
     const step = (text) => (p, seen) => onStep({ text: seen ? text : 'Mostre a mão para a câmera...', progress: p });
-    const open = await collect('ri', 2, step('Mão aberta, dedos afastados. Segure assim...'), signal);
-    onStep({ text: 'Agora junte a ponta do polegar com a ponta do indicador.', progress: 0 });
+    const open = await collect('curl', 2, step('Mão aberta, dedos esticados. Segure assim...'), signal);
+    onStep({ text: 'Agora feche a mão, como se segurasse uma bola pequena.', progress: 0 });
     await new Promise((r) => setTimeout(r, 1200));
-    const pinch = await collect('ri', 2, step('Pinça fechada. Segure assim...'), signal);
-    const o = median(open), p = median(pinch);
-    if (!(o - p > 0.2)) throw new Error('Não consegui diferenciar a mão aberta da pinça. Tente de novo com a mão mais perto e bem iluminada.');
-    calib.on = p + (o - p) * 0.3;
-    calib.off = p + (o - p) * 0.5;
+    const fist = await collect('curl', 2, step('Mão fechada. Segure assim...'), signal);
+    const o = median(open), f = median(fist);
+    if (!(f - o > 0.9)) throw new Error('Não consegui diferenciar a mão aberta da mão fechada. Tente de novo com a mão mais perto e bem iluminada.');
+    calib.open = o;
+    calib.fist = f;
     calib.custom = true;
     saveCalib();
-    return { open: o, pinch: p };
+    return { open: o, fist: f };
   } finally {
     calibrating = false;
   }
 }
 
 // ---------- Desenho das mãos sobre a cena ----------
-// Holograma da mão no estilo do HUD: palma translúcida com o "repulsor" no centro, dedos com brilho,
-// juntas e pontas marcadas, a pinça "carregando" conforme o polegar se aproxima, um estalo quando ela
-// fecha, a mira que trava em cima do holograma e uma linha até o que a mão está segurando.
+// Holograma da mão no estilo do HUD: palma translúcida com o "repulsor" no centro (que é o cursor),
+// dedos com brilho, juntas e pontas marcadas, o arco que enche conforme a mão fecha, um estalo quando
+// ela fecha, a mira que trava em cima do holograma, setas de girar e uma linha até o que ela segura.
 const FINGERS = [[0, 1, 2, 3, 4], [0, 5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], [0, 17, 18, 19, 20]];
 const PALM = [0, 1, 5, 9, 13, 17];
 const TIPS = [4, 8, 12, 16, 20];
@@ -350,13 +367,34 @@ function smoothPath(ctx, pts, closed, begin = true) {
   if (closed) ctx.closePath();
 }
 
-// Quanto a pinça está perto de fechar (0 = aberta, 1 = fechada)
-function closeness(r) {
-  const open = calib.off * 1.35;
-  return clamp01((open - r) / (open - calib.on));
+// Quanto a mão está perto de fechar (0 = aberta, 1 = fechou)
+function closeness(h) {
+  const open = gripLevel(0.12);
+  return clamp01((h.curl - open) / (gripLevel(GRIP_ON) - open));
 }
 
-// info(h) → { hold: 'model' | 'part' | null, target: { x, y } | null, hover: bool, pair: { x, y } | null }
+// Contorno da mão fechada: o fecho convexo dos pontos, estufado um pouco para fora (um punho limpo,
+// em vez dos dedos dobrados uns sobre os outros)
+function fistOutline(pts, pad) {
+  const p = [...pts].sort((a, b) => a.x - b.x || a.y - b.y);
+  const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+  const half = (list) => {
+    const out = [];
+    for (const q of list) {
+      while (out.length >= 2 && cross(out[out.length - 2], out[out.length - 1], q) <= 0) out.pop();
+      out.push(q);
+    }
+    return out.slice(0, -1);
+  };
+  const hull = half(p).concat(half([...p].reverse()));
+  const cx = hull.reduce((s, q) => s + q.x, 0) / hull.length, cy = hull.reduce((s, q) => s + q.y, 0) / hull.length;
+  return hull.map((q) => {
+    const d = Math.hypot(q.x - cx, q.y - cy) || 1;
+    return { x: q.x + ((q.x - cx) / d) * pad, y: q.y + ((q.y - cy) / d) * pad };
+  });
+}
+
+// info(h) → { hold: 'model' | null, target: { x, y } | null, hover: bool, pair: { x, y } | null, zoom: number }
 export function drawHands(info = () => ({})) {
   const dpr = Math.min(devicePixelRatio, 2);
   octx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -375,31 +413,54 @@ export function drawHands(info = () => ({})) {
   }
 }
 
+// Setinha (chevron) apontando para fora do cursor, na direção ang
+function chevron(ctx, x, y, r, ang, w) {
+  const dx = Math.cos(ang), dy = Math.sin(ang);
+  ctx.beginPath();
+  ctx.moveTo(x + dx * r - dy * w, y + dy * r + dx * w);
+  ctx.lineTo(x + dx * (r + w), y + dy * (r + w));
+  ctx.lineTo(x + dx * r + dy * w, y + dy * r - dx * w);
+  ctx.stroke();
+}
+
 function drawHand(h, pts, size, a, t, info, ghost = false) {
   const ctx = octx;
   const k = Math.max(0.65, Math.min(1.6, size / 0.2)); // mão perto da câmera = traços maiores
-  const kind = h.pinchKind || (t - h.vis.releaseAt < 0.3 ? h.vis.releaseKind : null);
-  const rgb = kind === 'middle' ? AMBER : CYAN;
+  const gripping = !ghost && h.grip;
+  const rgb = info.pair ? AMBER : CYAN;
   const born = t - h.vis.appearAt;
   const scanning = !ghost && born < 0.7;
 
-  // volume da mão: palma e dedos preenchidos de leve (parece uma luva holográfica), com contorno
+  // volume da mão: palma e dedos preenchidos de leve (parece uma luva holográfica), com contorno.
+  // Fechando, os dedos dobrados dão lugar ao contorno de um punho só.
   const palm = PALM.map((i) => pts[i]);
   const pc = { x: (pts[0].x + pts[5].x + pts[9].x + pts[13].x + pts[17].x) / 5, y: (pts[0].y + pts[5].y + pts[9].y + pts[13].y + pts[17].y) / 5 };
   const L = Math.hypot(pts[0].x - pts[9].x, pts[0].y - pts[9].y) + 1;
+  const shut = clamp01(((gripping ? 1 : closeness(h)) - 0.5) / 0.5);
   const grad = ctx.createRadialGradient(pc.x, pc.y, 0, pc.x, pc.y, L * 1.6);
-  grad.addColorStop(0, `rgba(${CYAN},${0.2 * a})`);
-  grad.addColorStop(1, `rgba(${CYAN},${0.05 * a})`);
-  ctx.beginPath();
-  smoothPath(ctx, palm, true, false);
-  FINGER_SHAPES.forEach((chain, i) => fingerShape(ctx, chain.map((j) => pts[j]), L * FINGER_W[i]));
+  grad.addColorStop(0, `rgba(${gripping ? rgb : CYAN},${(gripping ? 0.3 : 0.2) * a})`);
+  grad.addColorStop(1, `rgba(${gripping ? rgb : CYAN},${0.05 * a})`);
   ctx.fillStyle = grad;
-  ctx.fill('nonzero');
-  ctx.strokeStyle = `rgba(${CYAN},${0.42 * a})`;
   ctx.lineWidth = 1;
-  ctx.stroke();
+  if (shut < 1) {
+    ctx.globalAlpha = 1 - shut;
+    ctx.beginPath();
+    smoothPath(ctx, palm, true, false);
+    FINGER_SHAPES.forEach((chain, i) => fingerShape(ctx, chain.map((j) => pts[j]), L * FINGER_W[i]));
+    ctx.fill('nonzero');
+    ctx.strokeStyle = `rgba(${CYAN},${0.42 * a})`;
+    ctx.stroke();
+  }
+  if (shut > 0) {
+    ctx.globalAlpha = shut;
+    smoothPath(ctx, fistOutline(pts, L * 0.16), true);
+    ctx.fill();
+    ctx.strokeStyle = `rgba(${gripping ? rgb : CYAN},${0.55 * a})`;
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
 
-  // ossos dos dedos: núcleo claro com um brilho suave em volta
+  // ossos dos dedos: núcleo claro com um brilho suave em volta (mais discretos com a mão fechada)
   for (const pass of [0, 1]) {
     for (const f of FINGERS) {
       for (let j = 0; j < f.length - 1; j++) {
@@ -412,7 +473,7 @@ function drawHand(h, pts, size, a, t, info, ghost = false) {
           ctx.strokeStyle = `rgba(${CYAN},${0.12 * a})`;
           ctx.lineWidth = 6 * k * taper;
         } else {
-          ctx.strokeStyle = `rgba(${CORE},${0.8 * a})`;
+          ctx.strokeStyle = `rgba(${CORE},${(0.8 - 0.35 * shut) * a})`;
           ctx.lineWidth = 1.6 * k * taper;
         }
         ctx.stroke();
@@ -437,21 +498,6 @@ function drawHand(h, pts, size, a, t, info, ghost = false) {
     }
   }
 
-  // repulsor na palma: acende mais forte quando a mão está segurando algo
-  const live = h.pinchKind ? 1 : 0.45;
-  ctx.beginPath();
-  ctx.arc(pc.x, pc.y, 4.2 * k, 0, Math.PI * 2);
-  ctx.fillStyle = `rgba(${CORE},${0.75 * live * a})`;
-  ctx.fill();
-  ctx.lineWidth = 1.4;
-  ctx.strokeStyle = `rgba(${rgb},${0.8 * live * a})`;
-  for (let s = 0; s < 4; s++) {
-    const ang = t * (h.pinchKind ? 3 : 1.2) + (s * Math.PI) / 2;
-    ctx.beginPath();
-    ctx.arc(pc.x, pc.y, 9 * k, ang, ang + 0.9);
-    ctx.stroke();
-  }
-
   // linha de varredura quando a mão acaba de aparecer
   if (scanning) {
     let y0 = Infinity, y1 = -Infinity, x0 = Infinity, x1 = -Infinity;
@@ -466,29 +512,14 @@ function drawHand(h, pts, size, a, t, info, ghost = false) {
   }
   if (ghost) return;
 
-  // pinça "carregando": linha entre o polegar e o dedo que vai fechar, com o arco enchendo
-  const useMiddle = h.pinchKind ? h.pinchKind === 'middle' : h.rm < h.ri * 0.87;
-  const other = pts[useMiddle ? 12 : 8];
-  const c = h.pinchKind ? 1 : closeness(useMiddle ? h.rm : h.ri);
-  const prgb = useMiddle ? AMBER : CYAN;
-  if (!h.pinchKind && c > 0.05) {
-    ctx.beginPath();
-    ctx.moveTo(pts[4].x, pts[4].y);
-    ctx.lineTo(other.x, other.y);
-    ctx.strokeStyle = `rgba(${prgb},${0.25 + 0.6 * c})`;
-    ctx.lineWidth = 1 + 1.5 * c;
-    ctx.setLineDash([3, 4]);
-    ctx.stroke();
-    ctx.setLineDash([]);
-  }
-
-  // mira no ponto da pinça
+  // cursor no centro da palma (o "repulsor"): o arco enche conforme a mão fecha e trava quando fecha
   const x = h.x, y = h.y;
   const R = 15 * Math.max(0.85, Math.min(1.3, k));
-  if (h.pinchKind) {
+  const c = gripping ? 1 : closeness(h);
+  if (gripping) {
     ctx.beginPath();
-    ctx.arc(x, y, 8, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(${rgb},0.35)`;
+    ctx.arc(x, y, 9, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${rgb},0.3)`;
     ctx.fill();
     ctx.lineWidth = 2;
     ctx.strokeStyle = `rgba(${rgb},0.95)`;
@@ -498,31 +529,37 @@ function drawHand(h, pts, size, a, t, info, ghost = false) {
     ctx.lineWidth = 1;
     ctx.strokeStyle = `rgba(${rgb},0.55)`;
     ctx.stroke();
+    // setas para os quatro lados: mexer a mão fechada gira o holograma
+    if (info.hold && !info.pair) {
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = `rgba(${rgb},${0.6 + 0.25 * Math.sin(t * 5)})`;
+      for (let s = 0; s < 4; s++) chevron(ctx, x, y, R + 8, (s * Math.PI) / 2, 5.5);
+    }
   } else {
     ctx.lineWidth = 1.6;
-    ctx.strokeStyle = `rgba(${prgb},0.9)`;
+    ctx.strokeStyle = `rgba(${CYAN},0.9)`;
     for (let s = 0; s < 3; s++) {
       const ang = t * 1.6 + (s * Math.PI * 2) / 3;
       ctx.beginPath();
       ctx.arc(x, y, R, ang, ang + 1.25);
       ctx.stroke();
     }
-    // arco que enche conforme a pinça fecha
+    // arco que enche conforme a mão fecha
     if (c > 0.05) {
       ctx.beginPath();
       ctx.arc(x, y, R + 5, -Math.PI / 2, -Math.PI / 2 + c * Math.PI * 2);
       ctx.lineWidth = 2.2;
-      ctx.strokeStyle = `rgba(${prgb},${0.35 + 0.6 * c})`;
+      ctx.strokeStyle = `rgba(${CYAN},${0.35 + 0.6 * c})`;
       ctx.stroke();
     }
-    ctx.beginPath();
-    ctx.arc(x, y, 2.2, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(${prgb},0.95)`;
-    ctx.fill();
   }
+  ctx.beginPath();
+  ctx.arc(x, y, gripping ? 3.4 : 2.4, 0, Math.PI * 2);
+  ctx.fillStyle = `rgba(${CORE},0.95)`;
+  ctx.fill();
 
-  // trava na mira quando a mão está em cima do holograma
-  if (info.hover && !h.pinchKind) {
+  // trava na mira quando a mão aberta está em cima do holograma
+  if (info.hover && !gripping) {
     if (!h.vis.hover) h.vis.hoverAt = t;
     const e = ease((t - h.vis.hoverAt) / 0.18);
     const r2 = R + 9 + (1 - e) * 14;
@@ -539,9 +576,9 @@ function drawHand(h, pts, size, a, t, info, ghost = false) {
       ctx.stroke();
     }
   }
-  h.vis.hover = !!info.hover && !h.pinchKind;
+  h.vis.hover = !!info.hover && !gripping;
 
-  // estalo quando a pinça fecha e quando solta
+  // estalo quando a mão fecha e quando abre
   const snap = t - h.vis.snapAt;
   if (snap < 0.4) {
     ctx.beginPath();
@@ -559,9 +596,9 @@ function drawHand(h, pts, size, a, t, info, ghost = false) {
     ctx.stroke();
   }
 
-  // segurando: rastro do movimento e linha até o que está na mão
+  // segurando: rastro do movimento e linha até o holograma
   const tr = h.vis.trail;
-  if (h.pinchKind && info.hold) {
+  if (gripping && info.hold) {
     tr.push({ x, y, t });
     while (tr.length && t - tr[0].t > 0.22) tr.shift();
     for (let i = 1; i < tr.length; i++) {
@@ -574,7 +611,7 @@ function drawHand(h, pts, size, a, t, info, ghost = false) {
       ctx.stroke();
     }
     const tg = info.target;
-    if (tg && Math.hypot(tg.x - x, tg.y - y) > R + 6) {
+    if (tg && Math.hypot(tg.x - x, tg.y - y) > R + 16) {
       ctx.beginPath();
       ctx.moveTo(x, y);
       ctx.lineTo(tg.x, tg.y);
@@ -594,36 +631,51 @@ function drawHand(h, pts, size, a, t, info, ghost = false) {
     tr.length = 0;
   }
 
-  // as duas mãos no mesmo holograma: barra entre elas (girar e mudar o tamanho)
+  // as duas mãos fechadas: barra entre elas com o zoom
   if (info.pair && h === hands[0]) {
     const p2 = info.pair;
     ctx.beginPath();
     ctx.moveTo(x, y);
     ctx.lineTo(p2.x, p2.y);
     ctx.lineWidth = 1.5;
-    ctx.strokeStyle = `rgba(${CYAN},0.55)`;
+    ctx.strokeStyle = `rgba(${AMBER},0.6)`;
     ctx.stroke();
-    const mx = (x + p2.x) / 2, my = (y + p2.y) / 2;
     const ang = Math.atan2(p2.y - y, p2.x - x);
-    ctx.beginPath();
-    ctx.arc(mx, my, 11, ang - 1, ang + 1);
-    ctx.arc(mx, my, 11, ang + Math.PI - 1, ang + Math.PI + 1);
-    ctx.strokeStyle = `rgba(${CYAN},0.85)`;
-    ctx.lineWidth = 2;
-    ctx.stroke();
-    // marcas de régua ao longo da barra
     const len = Math.hypot(p2.x - x, p2.y - y);
+    // marcas de régua ao longo da barra e setas nas pontas (afastar = aproximar)
     for (let d = 24; d < len - 24; d += 18) {
       const qx = x + Math.cos(ang) * d, qy = y + Math.sin(ang) * d;
       ctx.beginPath();
       ctx.moveTo(qx - Math.sin(ang) * 3, qy + Math.cos(ang) * 3);
       ctx.lineTo(qx + Math.sin(ang) * 3, qy - Math.cos(ang) * 3);
       ctx.lineWidth = 1;
-      ctx.strokeStyle = `rgba(${CYAN},0.4)`;
+      ctx.strokeStyle = `rgba(${AMBER},0.4)`;
       ctx.stroke();
+    }
+    ctx.lineWidth = 1.8;
+    ctx.strokeStyle = `rgba(${AMBER},0.9)`;
+    chevron(ctx, x, y, R + 7, ang + Math.PI, 4.5);
+    chevron(ctx, p2.x, p2.y, R + 7, ang, 4.5);
+    if (info.zoom) {
+      const mx = (x + p2.x) / 2, my = (y + p2.y) / 2;
+      const label = `${info.zoom.toFixed(1).replace('.', ',')}×`;
+      ctx.font = '600 12px Inter, system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const w = ctx.measureText(label).width + 16;
+      ctx.fillStyle = 'rgba(8,14,20,0.8)';
+      ctx.beginPath();
+      ctx.roundRect?.(mx - w / 2, my - 11, w, 22, 11);
+      if (!ctx.roundRect) ctx.rect(mx - w / 2, my - 11, w, 22);
+      ctx.fill();
+      ctx.strokeStyle = `rgba(${AMBER},0.7)`;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.fillStyle = `rgba(${AMBER},1)`;
+      ctx.fillText(label, mx, my + 0.5);
     }
   }
 }
 
 // Ganchos para testes automatizados
-export const _test = { assign };
+export const _test = { assign, readHand, curls };

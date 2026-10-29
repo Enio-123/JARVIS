@@ -95,7 +95,7 @@ COMANDOS (todos opcionais, no JSON depois de ###)
 - "modelo": {"nome": "...", "partes": [...]}
 - "pronto": nome de um modelo anatômico real e detalhado (veja ANATOMIA). Use no lugar de "modelo".
 - "busca": {"termo": "o que procurar, em inglês", "nome": "nome em português"}: baixa da internet um modelo 3D detalhado feito por artistas (veja MODELOS DA INTERNET).
-- "acao": "explodir" (separa as peças em vista explodida, como o Tony faz), "montar" (junta de novo), "girar" ou "parar_giro".
+- "acao": "explodir" (separa as peças em vista explodida, como o Tony faz), "montar" (junta de novo), "girar", "parar_giro", "aproximar" (zoom no holograma) ou "afastar".
 - "musica": {"acao": "tocar", "faixa": "nome"}, ou {"acao": "parar" | "pausar" | "continuar" | "proxima" | "anterior"}, ou {"acao": "volume", "valor": 0 a 100}
 - "timer": {"segundos": N, "nome": "para que é"} ou {"cancelar": "nome"} (use "" para cancelar todos)
 - "lembrar": "fato curto sobre o usuário" (quando ele pedir para lembrar algo ou contar algo importante sobre si)
@@ -125,6 +125,7 @@ Exemplo: ### {"cena":"nova","pronto":"coracao"}
 
 MODELOS DA INTERNET
 Só quando o contexto disser que a busca do Sketchfab está ligada. Para coisas reais e concretas que ficam muito melhores com detalhe (carros, motos, aviões, naves, robôs, armaduras, personagens, animais, dinossauros, prédios, monumentos, instrumentos, objetos), use "busca" em vez de montar: "termo" com 1 a 4 palavras em inglês (por exemplo "iron man armor", "tyrannosaurus rex", "eiffel tower") e "nome" em português. Junto, mande um "modelo" simples de 3 a 8 peças como reserva: ele só aparece se a busca falhar. O que você explica peça por peça (átomos, moléculas, sistema solar, geometria, física, circuitos) continua montado com formas básicas, e anatomia humana continua com "pronto". Na fala, diga só que está trazendo o modelo; o autor e a licença já aparecem na tela. Um modelo baixado tem peças com nomes próprios: só cite entre colchetes os nomes que aparecem no Projetor, no contexto.
+Com a busca desligada, monte o modelo simples e, só na primeira vez na conversa em que pedirem uma coisa real (carro, animal, armadura...), avise numa frase curta que com o token do Sketchfab nas configurações você traz um modelo detalhado.
 Exemplo: ### {"cena":"nova","busca":{"termo":"iron man armor","nome":"Armadura do Homem de Ferro"},"modelo":{"nome":"Armadura do Homem de Ferro","partes":[{"nome":"Tronco","forma":"capsula","tam":[1,1.4,0.6],"pos":[0,1.6,0],"cor":"#b3121a","material":"metal"},{"nome":"Reator arc","forma":"cilindro","tam":[0.3,0.06,0.3],"pos":[0,1.8,0.31],"rot":[90,0,0],"cor":"#9fe8ff","material":"luz"},{"nome":"Capacete","forma":"esfera","tam":[0.55,0.65,0.6],"pos":[0,2.65,0],"cor":"#d4a017","material":"metal"}]}}
 
 MÚSICA
@@ -377,7 +378,7 @@ export function sanitizeCommands(d) {
   else if (busca) { out.cena = cena; out.busca = busca; out.modelo = modelo; }
   else if (modelo) { out.cena = cena; out.modelo = modelo; }
   const acao = norm(d.acao).replace(' ', '_');
-  if (['explodir', 'montar', 'girar', 'parar_giro'].includes(acao)) out.acao = acao;
+  if (['explodir', 'montar', 'girar', 'parar_giro', 'aproximar', 'afastar'].includes(acao)) out.acao = acao;
   if (d.musica && typeof d.musica === 'object') out.musica = { acao: norm(d.musica.acao), faixa: String(d.musica.faixa || ''), valor: d.musica.valor };
   if (d.timer && typeof d.timer === 'object') {
     if (d.timer.cancelar !== undefined) out.timer = { cancelar: String(d.timer.cancelar || '') };

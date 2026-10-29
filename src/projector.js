@@ -5,16 +5,19 @@ import { organicGeometry, tubeGeometry, latheGeometry, extrudeGeometry, gearGeom
 
 // Projetor holográfico: transforma o JSON do JARVIS em modelos feitos de formas básicas.
 // Cada modelo "se imprime" de baixo para cima (plano de corte + anel de varredura + fantasma em
-// arame), pode ser destacado peça por peça enquanto ele fala, explodido em vista separada,
-// e jogado para longe com a mão para sumir.
+// arame), pode ser destacado peça por peça enquanto ele fala e explodido em vista separada.
+// O modelo fica parado no centro do projetor: a pessoa só gira (para os lados e inclinando) e
+// aproxima ou afasta, como uma câmera em volta dele.
 const MAX_MODELS = 3;
 const BUILD_TIME = 1.25;
+const MAX_TILT = 1.35; // inclinação máxima (rad), para o modelo nunca ficar de cabeça para baixo
+const MIN_ZOOM = 0.35, MAX_ZOOM = 3;
 const ACCENT = new THREE.Color(0x5cd0ff);
-const yAxis = new THREE.Vector3(0, 1, 0);
 const box = new THREE.Box3();
 const size = new THREE.Vector3();
 const center = new THREE.Vector3();
 const tmp = new THREE.Vector3();
+const euler = new THREE.Euler(0, 0, 0, 'XYZ');
 
 // Formas desenhadas pelas próprias coordenadas (relativas a "pos"), sem esticar por "tam"
 const FREEFORM = new Set(['organico', 'curva', 'torno', 'extrusao', 'pronta']);
@@ -184,7 +187,7 @@ function buildPart(p, clipSolid, clipWire, wireMat, ghostMat, res) {
 
 export class Projector {
   constructor() {
-    this.models = []; // grupos raiz (são esses que a pinça pega)
+    this.models = []; // grupos raiz (são esses que a mão gira)
     this.leaving = [];
     this.lastTouch = 0;
     this.centerX = 0;
@@ -271,7 +274,7 @@ export class Projector {
       credit: modelo.credito || '',
       clipSolid, clipWire, wireMat, ghostMat, scan,
       explode: 0, exploded: false,
-      vel: null,
+      yaw: 0, tilt: 0, vyaw: 0, vtilt: 0, zoom: 1,
     };
     scene.add(root);
     return root;
@@ -293,7 +296,7 @@ export class Projector {
         m.position.copy(u.target);
         m.scale.setScalar(s);
       } else if (resetHome && !u.held) {
-        m.scale.setScalar(s);
+        u.zoom = 1;
       }
     });
   }
@@ -311,11 +314,29 @@ export class Projector {
     for (const m of [...this.models]) this.remove(m);
   }
 
-  // Joga o modelo para longe (gesto de descartar)
-  fling(m, vel) {
-    if (!this.models.includes(m)) return;
-    m.userData.flingVel = vel.clone().multiplyScalar(1.4);
-    this.remove(m);
+  // ---------- Girar e aproximar (mão fechada, mouse, dedo ou voz) ----------
+  turn(m, dyaw, dtilt) {
+    const u = m.userData;
+    u.yaw += dyaw;
+    u.tilt = THREE.MathUtils.clamp(u.tilt + dtilt, -MAX_TILT, MAX_TILT);
+    u.vyaw = u.vtilt = 0;
+    this.touched();
+  }
+
+  // Ao soltar: continua girando um pouco e para (rad/s)
+  setSpin(m, vyaw, vtilt) {
+    const u = m.userData;
+    u.vyaw = THREE.MathUtils.clamp(vyaw, -6, 6);
+    u.vtilt = THREE.MathUtils.clamp(vtilt, -4, 4);
+  }
+
+  zoomTo(m, z) {
+    m.userData.zoom = THREE.MathUtils.clamp(z, MIN_ZOOM, MAX_ZOOM);
+    this.touched();
+  }
+
+  zoomBy(f) {
+    for (const m of this.models) this.zoomTo(m, m.userData.zoom * f);
   }
 
   touched() {
@@ -453,13 +474,23 @@ export class Projector {
         if (u.build >= 1) this.finishBuild(m);
       }
 
-      if (u.held) {
-        u.home = false;
-      } else {
-        if (u.home && u.target) m.position.lerp(u.target, 1 - Math.exp(-dt * 4));
-        // gira devagar quando ninguém está mexendo, para mostrar que é 3D
-        if (idle && this.autoSpin) m.rotateOnWorldAxis(yAxis, dt * 0.18);
+      if (u.home && u.target) m.position.lerp(u.target, 1 - Math.exp(-dt * 4));
+      if (!u.held) {
+        if (Math.abs(u.vyaw) > 0.01 || Math.abs(u.vtilt) > 0.01) {
+          // embalo depois de soltar
+          u.yaw += u.vyaw * dt;
+          u.tilt = THREE.MathUtils.clamp(u.tilt + u.vtilt * dt, -MAX_TILT, MAX_TILT);
+          const d = Math.exp(-dt * 2.6);
+          u.vyaw *= d;
+          u.vtilt *= d;
+        } else if (idle && this.autoSpin) {
+          // gira devagar quando ninguém está mexendo, para mostrar que é 3D
+          u.yaw += dt * 0.18;
+        }
       }
+      m.quaternion.setFromEuler(euler.set(u.tilt, u.yaw, 0));
+      const want = u.base * u.zoom;
+      if (Math.abs(m.scale.x - want) > want * 1e-4) m.scale.setScalar(m.scale.x + (want - m.scale.x) * (1 - Math.exp(-dt * 12)));
 
       // vista explodida
       const goal = u.exploded ? 1 : 0;
@@ -502,13 +533,7 @@ export class Projector {
 
     for (const m of [...this.leaving]) {
       const u = m.userData;
-      if (u.flingVel) {
-        m.position.addScaledVector(u.flingVel, dt);
-        u.flingVel.multiplyScalar(Math.exp(-dt * 1.5));
-        u.leave -= dt / 0.55;
-      } else {
-        u.leave -= dt / 0.3;
-      }
+      u.leave -= dt / 0.3;
       if (u.leave <= 0) {
         scene.remove(m);
         scene.remove(u.scan);

@@ -413,7 +413,7 @@ export class Character {
     this.pool.material.opacity = thrust * 0.8;
     this.thrusterMat.color.copy(ACCENT).multiplyScalar(0.4 + thrust * 0.8);
 
-    // giro de alegria (quando a pessoa "faz carinho" com a pinça)
+    // giro de alegria (quando a pessoa toca nele: mão fechada em cima dele, clique ou toque)
     if (this.spinT > 0) {
       this.spinT = Math.max(0, this.spinT - dt / 0.9);
       const e = 1 - this.spinT;
